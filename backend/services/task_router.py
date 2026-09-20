@@ -510,16 +510,45 @@ def route_task(
     user_request: str,
     has_image: bool = False,
     has_scanned_pdf: bool = False,
+    conversation_history: list[dict] | None = None,
 ) -> dict:
     """
     Public task router entry point.
     Returns enriched, auditable routing decision with model candidates and license gate.
+    If classified as GENERAL and conversation_history is provided, consults the conversational
+    context resolver to check if a valid structured knowledge subject exists, promoting to RAG if so.
     """
     raw_decision = _raw_route_task(
         user_request=user_request,
         has_image=has_image,
         has_scanned_pdf=has_scanned_pdf,
     )
+
+    # Conversational follow-up gate:
+    # When a follow-up is detected, ask the existing conversational-context resolver
+    # whether a valid previous knowledge subject exists. Only promote to RAG when
+    # that resolver returns a concrete subject/retrieval context.
+    if (not raw_decision.get("requires_rag", False) or raw_decision.get("task_type") == "GENERAL") and conversation_history:
+        try:
+            from backend.services.voice.context_policy import determine_conversational_context
+            ctx = determine_conversational_context(
+                current_query=user_request,
+                conversation_history=conversation_history,
+            )
+            if ctx.is_followup and (ctx.target_entity or (ctx.resolved_retrieval_query and ctx.resolved_retrieval_query.strip().lower() != user_request.strip().lower())):
+                model_entry, tools = select_model_and_tools("RAG", has_image=has_image, has_scanned_pdf=has_scanned_pdf)
+                raw_decision["task_type"] = "RAG"
+                raw_decision["requires_rag"] = True
+                raw_decision["reason"] = f"Conversational follow-up resolved to structured subject: {ctx.target_entity or ctx.resolved_retrieval_query}"
+                raw_decision["model"] = model_entry["ollama_model_name"]
+                raw_decision["model_id"] = model_entry["id"]
+                raw_decision["endpoint"] = model_entry["endpoint"]
+                raw_decision["tools"] = tools
+                raw_decision["retrieval_query"] = ctx.resolved_retrieval_query
+                raw_decision["target_entity"] = ctx.target_entity
+        except Exception as err:
+            logger.warning("Conversational context resolution in task router failed: %s", err)
+
     return _enrich_decision(raw_decision)
 
 
@@ -528,6 +557,7 @@ def classify_task_type(
     has_image: bool = False,
     has_scanned_pdf: bool = False,
     router_model_id: str = "gemma3_4b",
+    conversation_history: list[dict] | None = None,
 ) -> dict:
     """
     Backward-compatible classification wrapper returning legacy fields
@@ -537,8 +567,9 @@ def classify_task_type(
         user_request,
         has_image=has_image,
         has_scanned_pdf=has_scanned_pdf,
+        conversation_history=conversation_history,
     )
-    return {
+    res = {
         "task_type": decision["task_type"],
         "reasoning": decision["reason"],
         "model": decision["model"],
@@ -547,6 +578,11 @@ def classify_task_type(
         "requires_sandbox": decision["requires_sandbox"],
         "tools": decision["tools"],
     }
+    if "retrieval_query" in decision:
+        res["retrieval_query"] = decision["retrieval_query"]
+    if "target_entity" in decision:
+        res["target_entity"] = decision["target_entity"]
+    return res
 
 
 def validate_model_selection(model_id: str) -> dict:

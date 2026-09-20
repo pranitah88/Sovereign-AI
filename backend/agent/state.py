@@ -96,6 +96,7 @@ class AgentState:
     error_info: str | None = None
     target_document: str | None = None
     deliverable: dict | None = None
+    structured_metrics: list[dict[str, Any]] | None = None
     # ── Governance & Execution Trace ─────────────────────────────────
     trace_id: str = ""
     execution_trace: list[dict] = field(default_factory=list)

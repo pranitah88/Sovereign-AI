@@ -77,53 +77,92 @@ def evaluate_retrieval_confidence(
             metrics={"source_count": 0, "best_distance": None},
         )
 
-    # 1. Inspect distances and scores from sources
-    if not sources or len(sources) == 0:
-        return ConfidenceDecision(
-            confidence_score=0.0,
-            status="INSUFFICIENT_EVIDENCE",
-            is_sufficient=False,
-            escalation_required=True,
-            reason="Zero authorized technical documents retrieved for this query.",
-            metrics={"source_count": 0, "best_distance": None, "avg_distance": None, "best_rerank_score": None},
-        )
-
+    # 1. Extract and normalize signals from retrieved sources
     distances = []
     rerank_scores = []
+    bm25_scores = []
 
     for s in sources:
-        dist_val = s.get("distance") if s.get("distance") is not None else s.get("dist")
+        dist_val = s.get("cosine_distance") if s.get("cosine_distance") is not None else (
+            s.get("distance") if s.get("distance") is not None else s.get("dist")
+        )
         if dist_val is not None:
-            distances.append(float(dist_val))
+            try:
+                d = float(dist_val)
+                # If distance > 1.0, it is a raw squared L2 distance from Chroma (||u - v||^2 in [0, 2]).
+                # Convert to normalized cosine distance in [0, 1]:
+                if d > 1.0:
+                    d = min(1.0, max(0.0, d / 2.0))
+                distances.append(d)
+            except (ValueError, TypeError):
+                pass
+
         rerank_val = s.get("rerank_score") if s.get("rerank_score") is not None else s.get("score")
         if rerank_val is not None:
-            rerank_scores.append(float(rerank_val))
+            try:
+                rerank_scores.append(float(rerank_val))
+            except (ValueError, TypeError):
+                pass
+
+        bm25_val = s.get("bm25_score")
+        if bm25_val is not None:
+            try:
+                bm25_scores.append(float(bm25_val))
+            except (ValueError, TypeError):
+                pass
 
     best_dist = min(distances) if distances else None
     avg_dist = (sum(distances) / len(distances)) if distances else None
+    distance_available = best_dist is not None
+
     best_rerank = max(rerank_scores) if rerank_scores else None
+    rerank_available = best_rerank is not None
 
-    # Calculate normalized confidence (0.0 to 1.0)
-    if best_dist is not None:
-        # Lower distance is higher confidence
-        # Distance 0.3 -> 0.95, Distance 0.8 -> 0.20
-        raw_conf = max(0.0, min(1.0, 1.0 - ((best_dist - 0.2) / 0.7)))
+    best_bm25 = max(bm25_scores) if bm25_scores else None
+    bm25_available = best_bm25 is not None
+
+    # Deterministic signal normalization (heuristic normalization for fusion, NOT probability calibration)
+    import math
+
+    def _sigmoid(x: float) -> float:
+        # Logistic curve mapping unbounded CrossEncoder logits to [0, 1] for signal fusion
+        return 1.0 / (1.0 + math.exp(-0.5 * x))
+
+    def _clamp(val: float, low: float = 0.0, high: float = 1.0) -> float:
+        return max(low, min(high, val))
+
+    rerank_signal = _clamp(_sigmoid(best_rerank)) if rerank_available else None
+    dense_signal = _clamp(1.0 - ((best_dist - 0.15) / 0.70)) if distance_available else None
+    bm25_signal = _clamp(best_bm25 / 15.0) if bm25_available else None
+
+    # Multi-Signal Evidence Fusion (do not penalize a candidate because another signal is absent)
+    if rerank_signal is not None and dense_signal is not None:
+        confidence = 0.60 * rerank_signal + 0.40 * dense_signal
+    elif rerank_signal is not None and bm25_signal is not None:
+        confidence = 0.60 * rerank_signal + 0.40 * bm25_signal
+    elif rerank_signal is not None:
+        confidence = rerank_signal
+    elif dense_signal is not None:
+        confidence = dense_signal
+    elif bm25_signal is not None:
+        confidence = bm25_signal
     else:
-        # Fall back to source count heuristic if distances are stripped
-        raw_conf = min(0.85, 0.4 + (len(sources) * 0.15))
-
-    # Boost for cross-encoder reranker confirmation
-    if best_rerank is not None:
-        if best_rerank > 2.0:
-            raw_conf = min(1.0, raw_conf + 0.1)
-        elif best_rerank < MIN_RERANK_SCORE:
-            raw_conf = max(0.1, raw_conf - 0.25)
+        # Fallback heuristic if all numerical signals are absent
+        confidence = min(0.85, 0.40 + (len(sources) * 0.15))
 
     metrics = {
         "source_count": len(sources),
+        "distance_available": distance_available,
         "best_distance": round(best_dist, 4) if best_dist is not None else None,
         "avg_distance": round(avg_dist, 4) if avg_dist is not None else None,
+        "rerank_available": rerank_available,
         "best_rerank_score": round(best_rerank, 4) if best_rerank is not None else None,
+        "bm25_available": bm25_available,
+        "best_bm25_score": round(best_bm25, 4) if best_bm25 is not None else None,
+        "dense_signal": round(dense_signal, 4) if dense_signal is not None else None,
+        "rerank_signal": round(rerank_signal, 4) if rerank_signal is not None else None,
+        "bm25_signal": round(bm25_signal, 4) if bm25_signal is not None else None,
+        "fused_confidence": round(confidence, 4),
     }
 
     # 2. Temporal validation integration
@@ -141,7 +180,7 @@ def evaluate_retrieval_confidence(
             metrics["temporal_status"] = t_status
             metrics["latest_reporting_period"] = t_period
             return ConfidenceDecision(
-                confidence_score=min(raw_conf, 0.20),
+                confidence_score=min(confidence, 0.20),
                 status="INSUFFICIENT_EVIDENCE",
                 is_sufficient=False,
                 escalation_required=True,
@@ -152,7 +191,7 @@ def evaluate_retrieval_confidence(
         if t_status == "TEMPORAL_MISMATCH":
             metrics["temporal_status"] = t_status
             return ConfidenceDecision(
-                confidence_score=min(raw_conf, 0.25),
+                confidence_score=min(confidence, 0.25),
                 status="INSUFFICIENT_EVIDENCE",
                 is_sufficient=False,
                 escalation_required=True,
@@ -161,28 +200,40 @@ def evaluate_retrieval_confidence(
             )
 
     # 3. Decision logic
-    if (best_dist is not None and best_dist > MAX_ACCEPTABLE_DISTANCE) or raw_conf < 0.35:
+    # Distance failure ONLY if distance is available and strictly exceeds MAX_ACCEPTABLE_DISTANCE
+    if best_dist is not None and best_dist > MAX_ACCEPTABLE_DISTANCE:
         return ConfidenceDecision(
-            confidence_score=raw_conf,
+            confidence_score=confidence,
             status="INSUFFICIENT_EVIDENCE",
             is_sufficient=False,
             escalation_required=True,
-            reason=f"Retrieved document distance ({round(best_dist, 3) if best_dist else 'high'}) exceeds acceptable threshold ({MAX_ACCEPTABLE_DISTANCE}). Evidence is insufficient to answer without hallucination.",
+            reason=f"Retrieved document distance ({round(best_dist, 3)}) exceeds acceptable threshold ({MAX_ACCEPTABLE_DISTANCE}). Evidence is insufficient to answer without hallucination.",
             metrics=metrics,
         )
 
-    if (best_dist is not None and best_dist <= STRONG_DISTANCE_THRESHOLD) or raw_conf >= 0.70:
+    # Low relevance/confidence failure
+    if confidence < 0.35:
         return ConfidenceDecision(
-            confidence_score=raw_conf,
+            confidence_score=confidence,
+            status="INSUFFICIENT_EVIDENCE",
+            is_sufficient=False,
+            escalation_required=True,
+            reason=f"Evidence relevance/confidence ({round(confidence, 3)}) was below the minimum sufficiency threshold (0.35).",
+            metrics=metrics,
+        )
+
+    if confidence >= 0.70 or (best_dist is not None and best_dist <= STRONG_DISTANCE_THRESHOLD and confidence >= 0.50):
+        return ConfidenceDecision(
+            confidence_score=confidence,
             status="HIGH_CONFIDENCE",
             is_sufficient=True,
             escalation_required=False,
-            reason="Strong documentary evidence corroborated by vector distance and keyword overlap.",
+            reason="Strong documentary evidence corroborated by available retrieval signals.",
             metrics=metrics,
         )
 
     return ConfidenceDecision(
-        confidence_score=raw_conf,
+        confidence_score=confidence,
         status="MODERATE_CONFIDENCE",
         is_sufficient=True,
         escalation_required=False,

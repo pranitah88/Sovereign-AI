@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from langgraph.graph import StateGraph, START, END
 
 from backend.agent.prompts import (
     CODE_CORRECTION_PROMPT,
@@ -30,16 +31,39 @@ from backend.database.connection import get_connection, transaction
 from backend.database.repositories import chat as chat_repo
 from backend.services.audit import DOCUMENT_GENERATED, DOCUMENT_GENERATION_FAILED, audit_log
 from backend.services.rag_engine import clean_document_title
-from backend.services.task_router import classify_task_type, route_task, select_model_and_tools
+from backend.services.task_router import route_task
 
 logger = logging.getLogger(__name__)
 
 
 def strip_raw_ui_markers(text: str) -> str:
-    """Remove internal UI and icon step markers leaking from DOM/accessibility trees."""
+    """
+    Remove internal UI/svg step markers, and sanitize raw markdown asterisks (* and **)
+    from assistant prose outside code blocks for clean structured text rendering.
+    """
     if not text or not isinstance(text, str):
         return ""
-    return re.sub(r'svg(?:Copy|Query|Retrieval|Model|Tools|Response|Download)', '', text, flags=re.IGNORECASE).strip()
+
+    # 1. Strip internal SVG markers
+    cleaned = re.sub(r'svg(?:Copy|Query|Retrieval|Model|Tools|Response|Download)', '', text, flags=re.IGNORECASE).strip()
+
+    # 2. Preserve code blocks while sanitizing markdown asterisks in prose
+    parts = re.split(r'(```[\s\S]*?```)', cleaned)
+    for i in range(0, len(parts), 2):
+        p = parts[i]
+        # Remove bold markdown **...**
+        p = re.sub(r'\*\*([^*]+)\*\*', r'\1', p)
+        # Remove double asterisks that may be unclosed
+        p = p.replace('**', '')
+        # Remove asterisk bullets at line start
+        p = re.sub(r'(?m)^\s*\*\s+', '', p)
+        # Clean dash bullets before common labels (e.g. "- Purpose:" -> "Purpose:")
+        p = re.sub(r'(?m)^\s*-\s+(Purpose|Function|Role|Capacity|Details|Status|Note|Output|Inputs|Feedstock|Products?):', r'\1:', p, flags=re.IGNORECASE)
+        # Remove remaining standalone emphasis asterisks *word*
+        p = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'\1', p)
+        parts[i] = p
+
+    return "".join(parts).strip()
 
 
 def is_code_modification_request(query: str) -> bool:
@@ -115,10 +139,24 @@ def node_classify(state: AgentState) -> AgentState:
         {"current_query": current_q, "trace_id": state.trace_id},
     )
 
+    from backend.services.entity_preservation import detect_query_language_deterministic
+    query_lang = detect_query_language_deterministic(current_q)
+    _add_trace_event(
+        state,
+        "QUERY_LANGUAGE_DETECTED",
+        f'Query Language: {query_lang} (Authoritative: current_user_query)',
+        "verified",
+        {
+            "QUERY_LANGUAGE": query_lang,
+            "LANGUAGE_DECISION_SOURCE": "current_user_query",
+        },
+    )
+
     decision = route_task(
         current_q,
         has_image=state.has_image,
         has_scanned_pdf=state.has_scanned_pdf,
+        conversation_history=state.chat_history or state.conversation_history,
     )
 
     state.task_type = decision["task_type"]
@@ -320,6 +358,8 @@ def node_retrieve(state: AgentState) -> AgentState:
     )
 
     result = execute_tool("rag_search", user=user, query=retrieval_query)
+    if isinstance(result, dict):
+        result["query"] = retrieval_query
     state.retrieval_ms = int((time.perf_counter() - retrieval_start) * 1000)
 
     if result["status"] == "success":
@@ -1035,7 +1075,7 @@ def node_reason(state: AgentState) -> AgentState:
             extract_structured_metrics,
             format_hybrid_final_response,
         )
-        metrics = state.structured_metrics
+        metrics = state.structured_metrics or []
         if not metrics and state.context:
             metrics = extract_structured_metrics(state.context, state.sources, state.query)
             state.structured_metrics = metrics
@@ -1129,13 +1169,13 @@ def node_reason(state: AgentState) -> AgentState:
                         state.response = regenerated
                     else:
                         logger.warning("Unit grounding validation failed again after regeneration: %s. Returning controlled refusal.", regen_failure)
-                        from backend.services.multilingual import normalize_query
-                        norm = normalize_query(state.query)
-                        if norm.detected_language == "marathi":
+                        from backend.services.entity_preservation import detect_query_language_deterministic
+                        detected_lang = detect_query_language_deterministic(state.current_query)
+                        if detected_lang == "mr":
                             state.response = (
                                 "MRPL च्या ज्ञान स्त्रोतांमध्ये उपलब्ध माहितीनुसार, इतर युनिट्सची माहिती मिसळल्याशिवाय या युनिटचे फीड आणि प्रमुख उत्पादने निश्चितपणे सांगण्यासाठी पुरेसा पुरावा उपलब्ध नाही."
                             )
-                        elif norm.detected_language == "hindi":
+                        elif detected_lang == "hi":
                             state.response = (
                                 "MRPL के ज्ञान आधार में प्राप्त दस्तावेजों के आधार पर, अन्य इकाइयों के विवरण को शामिल किए बिना इस विशिष्ट इकाई के फीड और उत्पादों की पुष्टि करने के लिए पर्याप्त साक्ष्य उपलब्ध नहीं हैं।"
                             )
@@ -1145,11 +1185,11 @@ def node_reason(state: AgentState) -> AgentState:
                             )
                 else:
                     logger.warning("No primary evidence available for unit %s to regenerate. Returning controlled refusal.", target_unit)
-                    from backend.services.multilingual import normalize_query
-                    norm = normalize_query(state.query)
-                    if norm.detected_language == "marathi":
+                    from backend.services.entity_preservation import detect_query_language_deterministic
+                    detected_lang = detect_query_language_deterministic(state.current_query)
+                    if detected_lang == "mr":
                         state.response = "MRPL च्या ज्ञान स्त्रोतांमध्ये या युनिटसाठी स्वतंत्र माहिती उपलब्ध नाही."
-                    elif norm.detected_language == "hindi":
+                    elif detected_lang == "hi":
                         state.response = "MRPL के ज्ञान आधार में इस इकाई के लिए अलग से विवरण उपलब्ध नहीं है।"
                     else:
                         state.response = "I couldn't find sufficient information in the local knowledge base for this specific refinery unit."
@@ -1315,6 +1355,26 @@ def node_validate(state: AgentState) -> AgentState:
     # 1. Normalize citations and construct verified Sources section
     state.response = _normalize_citations_and_sources(state.response, state.sources)
 
+    # 1b. Language & Technical Entity Fidelity Verification (Deterministic query-language isolation & entity preservation)
+    try:
+        from backend.services.entity_preservation import validate_and_preserve_entities
+        fidelity_res = validate_and_preserve_entities(
+            response=state.response,
+            query=state.current_query,
+            evidence=state.context,
+        )
+        state.response = fidelity_res.corrected_response
+        _add_trace_event(
+            state,
+            "TECHNICAL_ENTITY_VALIDATION",
+            f"Language & Entity Fidelity: {fidelity_res.technical_entity_validation} "
+            f"(Query: {fidelity_res.query_language}, Response: {fidelity_res.response_language})",
+            "verified" if fidelity_res.technical_entity_validation in ("PASSED", "CORRECTED") else "flagged",
+            fidelity_res.to_dict(),
+        )
+    except Exception as ent_err:
+        logger.warning("Error during entity and language fidelity check in node_validate: %s", ent_err)
+
     # 2. Extract numbers from body only (ignoring the Sources section)
     body_only = re.split(r'\n+(?:##\s*)?Sources:\s*\n', state.response, flags=re.IGNORECASE)[0]
     response_numbers = set(_extract_numbers(body_only))
@@ -1378,13 +1438,13 @@ def node_validate(state: AgentState) -> AgentState:
             )
             if not is_valid:
                 logger.warning("Deterministic unit grounding failure detected in node_validate: %s", failure_reason)
-                from backend.services.multilingual import normalize_query
-                norm = normalize_query(state.query)
-                if norm.detected_language == "marathi":
+                from backend.services.entity_preservation import detect_query_language_deterministic
+                detected_lang = detect_query_language_deterministic(state.current_query)
+                if detected_lang == "mr":
                     state.response = (
                         "MRPL च्या ज्ञान स्त्रोतांमध्ये उपलब्ध माहितीनुसार, इतर युनिट्सची माहिती मिसळल्याशिवाय या युनिटचे फीड आणि प्रमुख उत्पादने निश्चितपणे सांगण्यासाठी पुरेसा पुरावा उपलब्ध नाही."
                     )
-                elif norm.detected_language == "hindi":
+                elif detected_lang == "hi":
                     state.response = (
                         "MRPL के ज्ञान आधार में प्राप्त दस्तावेजों के आधार पर, अन्य इकाइयों के विवरण को शामिल किए बिना इस विशिष्ट इकाई के फीड और उत्पादों की पुष्टि करने के लिए पर्याप्त साक्ष्य उपलब्ध नहीं हैं।"
                     )
@@ -1541,6 +1601,130 @@ def check_agent_safety_limits(current_state: AgentState, start_time: float) -> N
     if time.monotonic() - start_time > TASK_TIMEOUT_SECONDS:
         logger.error("Agent execution timed out after %ds", TASK_TIMEOUT_SECONDS)
         raise TimeoutError(f"Agent task execution exceeded timeout limit ({TASK_TIMEOUT_SECONDS}s). Stopped for safety.")
+
+
+# ── LangGraph Node Wrappers ──────────────────────────────────────────────
+# These thin wrappers bridge existing node functions (which mutate AgentState
+# in-place and return it) to LangGraph's dict-return contract.
+# The actual business logic remains ENTIRELY in node_classify, node_retrieve, etc.
+
+def _lg_classify(state: AgentState) -> dict:
+    """LangGraph wrapper for node_classify."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: classify", "verified")
+    updated = node_classify(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: classify completed", "verified")
+    return updated.__dict__
+
+
+def _lg_retrieve(state: AgentState) -> dict:
+    """LangGraph wrapper for node_retrieve."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: retrieve", "verified")
+    updated = node_retrieve(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: retrieve completed", "verified")
+    return updated.__dict__
+
+
+def _lg_tool_call(state: AgentState) -> dict:
+    """LangGraph wrapper for node_tool_call."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: tool_call", "verified")
+    updated = node_tool_call(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: tool_call completed", "verified")
+    return updated.__dict__
+
+
+def _lg_reason(state: AgentState) -> dict:
+    """LangGraph wrapper for node_reason."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: reason", "verified")
+    updated = node_reason(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: reason completed", "verified")
+    return updated.__dict__
+
+
+def _lg_validate(state: AgentState) -> dict:
+    """LangGraph wrapper for node_validate."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: validate", "verified")
+    updated = node_validate(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: validate completed", "verified")
+    return updated.__dict__
+
+
+def _lg_respond(state: AgentState) -> dict:
+    """LangGraph wrapper for node_respond."""
+    _add_trace_event(state, "GRAPH_NODE_ENTERED", "Graph node: respond", "verified")
+    updated = node_respond(state)
+    _add_trace_event(updated, "GRAPH_NODE_COMPLETED", "Graph node: respond completed", "verified")
+    return updated.__dict__
+
+
+# ── LangGraph Conditional Routing ────────────────────────────────────────
+
+def route_after_retrieve(state: AgentState) -> str:
+    """
+    Conditional routing after the retrieve node.
+
+    If retrieval/security processing determined that the task must terminate early
+    (RBAC denied, insufficient evidence, temporal refusal), route directly to respond.
+    Otherwise, continue to tool_call.
+    """
+    if state.current_step in {
+        "rbac_denied",
+        "insufficient_evidence",
+        "temporal_refusal",
+    }:
+        return "respond"
+    return "tool_call"
+
+
+# ── LangGraph Construction ───────────────────────────────────────────────
+
+def build_agent_graph():
+    """
+    Build and compile the LangGraph StateGraph for the sovereign agent pipeline.
+
+    Graph structure:
+        START → classify → retrieve → [conditional] → tool_call → reason → validate → respond → END
+                                        ↓ (early refusal)
+                                      respond → END
+
+    LangGraph controls WHICH node executes next.
+    Python services inside nodes decide WHETHER an operation is allowed.
+    """
+    workflow = StateGraph(AgentState)
+
+    # Register nodes
+    workflow.add_node("classify", _lg_classify)
+    workflow.add_node("retrieve", _lg_retrieve)
+    workflow.add_node("tool_call", _lg_tool_call)
+    workflow.add_node("reason", _lg_reason)
+    workflow.add_node("validate", _lg_validate)
+    workflow.add_node("respond", _lg_respond)
+
+    # Define edges
+    workflow.add_edge(START, "classify")
+    workflow.add_edge("classify", "retrieve")
+
+    # Conditional routing after retrieve:
+    # - Early refusal (RBAC denied, insufficient evidence, temporal refusal) → respond → END
+    # - Normal flow → tool_call → reason → validate → respond → END
+    workflow.add_conditional_edges(
+        "retrieve",
+        route_after_retrieve,
+        {
+            "respond": "respond",
+            "tool_call": "tool_call",
+        },
+    )
+
+    workflow.add_edge("tool_call", "reason")
+    workflow.add_edge("reason", "validate")
+    workflow.add_edge("validate", "respond")
+    workflow.add_edge("respond", END)
+
+    return workflow.compile()
+
+
+# Compile the graph at module level — this is the single authoritative orchestration path.
+agent_graph = build_agent_graph()
 
 
 def _build_agent_return(state: AgentState) -> dict:
@@ -1739,7 +1923,16 @@ async def run_agent(
     if session_id:
         messages = chat_repo.list_messages(session_id)
         state.chat_history = [
-            {"role": m["role"], "content": m["content"]}
+            {
+                "role": m["role"],
+                "content": m["content"],
+                "sources": m.get("sources"),
+                "tool_calls": m.get("tool_calls"),
+                "model_id": m.get("model_id"),
+                "task_type": m.get("task_type"),
+                "retrieval_query": m.get("retrieval_query"),
+                "target_entity": m.get("target_entity"),
+            }
             for m in messages[-20:]  # Last 20 messages for context
         ]
 
@@ -1752,38 +1945,36 @@ async def run_agent(
         state.task_id = cursor.lastrowid
 
     try:
-        # Loop iteration & safety bounds check
-        def _check_safety(s: AgentState):
-            check_agent_safety_limits(s, start_time)
+        # ── Invoke the compiled LangGraph StateGraph ──────────────────
+        # This is the SINGLE authoritative orchestration path.
+        # LangGraph controls which node executes next.
+        # Python services inside nodes decide whether an operation is allowed.
+        check_agent_safety_limits(state, start_time)
 
-        # Execute pipeline with safety verification at each step
-        _check_safety(state)
-        state = node_classify(state)
+        _add_trace_event(
+            state,
+            "LANGGRAPH_INVOCATION",
+            "Invoking LangGraph StateGraph agent pipeline",
+            "verified",
+            {"graph_nodes": ["classify", "retrieve", "tool_call", "reason", "validate", "respond"]},
+        )
 
-        # Update task with classified type.
-        with transaction() as conn:
-            conn.execute(
-                "UPDATE tasks SET task_type = ?, model_id = ? WHERE id = ?",
-                (state.task_type, state.model_id, state.task_id),
-            )
+        result_dict = await agent_graph.ainvoke(state)
 
-        _check_safety(state)
-        state = node_retrieve(state)
-        if state.current_step in ("rbac_denied", "insufficient_evidence", "temporal_refusal"):
-            state = node_respond(state)
-            return _build_agent_return(state)
+        # Reconstruct AgentState from the result dict for _build_agent_return()
+        # Filter out any keys not in AgentState fields to avoid unexpected keyword args
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(AgentState)}
+        filtered_result = {k: v for k, v in result_dict.items() if k in valid_fields}
+        final_state = AgentState(**filtered_result)
 
-        _check_safety(state)
-        state = node_tool_call(state)
-
-        _check_safety(state)
-        state = node_reason(state)
-
-        _check_safety(state)
-        state = node_validate(state)
-
-        _check_safety(state)
-        state = node_respond(state)
+        # Update task with classified type (post-graph, since classify ran inside graph)
+        if final_state.task_id and final_state.task_type:
+            with transaction() as conn:
+                conn.execute(
+                    "UPDATE tasks SET task_type = ?, model_id = ? WHERE id = ?",
+                    (final_state.task_type, final_state.model_id, final_state.task_id),
+                )
 
     except Exception as exc:
         logger.error("Agent pipeline failed: %s", exc, exc_info=True)
@@ -1798,7 +1989,7 @@ async def run_agent(
 
         raise
 
-    return _build_agent_return(state)
+    return _build_agent_return(final_state)
 
 
 # ── Private helpers ──────────────────────────────────────────────────────

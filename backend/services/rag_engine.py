@@ -1062,11 +1062,19 @@ def query_knowledge_base(
         ):
             if not is_chunk_authorized(meta):
                 continue
+            raw_dist = float(dist)
+            # Chroma HNSW collection uses space="l2" (squared Euclidean distance).
+            # Because embeddings are strictly unit-normalized (||u||=1, ||v||=1),
+            # ||u - v||^2 = 2 * (1 - cos(u, v)) = 2 * cosine_distance.
+            # Convert squared L2 distance to standard cosine distance in [0.0, 1.0]:
+            cosine_dist = min(1.0, max(0.0, raw_dist / 2.0))
             vector_candidates[cid] = {
                 "chunk_id": cid,
                 "text": doc,
                 "metadata": meta,
-                "dist": float(dist),
+                "dist": cosine_dist,
+                "chroma_l2_distance": raw_dist,
+                "cosine_distance": cosine_dist,
                 "vector_rank": rank,
             }
 
@@ -1140,7 +1148,8 @@ def query_knowledge_base(
 
         text = str((vec_info["text"] if vec_info else bm25_info["text"]) or "")
         meta = (vec_info["metadata"] if vec_info else bm25_info["metadata"]) or {}
-        dist = vec_info["dist"] if vec_info else 1.0
+        dist = vec_info["dist"] if vec_info else None
+        chroma_l2_dist = vec_info.get("chroma_l2_distance") if vec_info else None
 
         rrf_score = 0.0
         if vec_info:
@@ -1153,6 +1162,8 @@ def query_knowledge_base(
             "text": text,
             "metadata": meta,
             "dist": dist,
+            "chroma_l2_distance": chroma_l2_dist,
+            "cosine_distance": dist,
             "vector_rank": vec_info["vector_rank"] if vec_info else 999,
             "bm25_rank": bm25_info["bm25_rank"] if bm25_info else 999,
             "bm25_score": bm25_info["bm25_score"] if bm25_info else 0.0,
@@ -1389,7 +1400,10 @@ def query_knowledge_base(
             "page": page,
             "score": round(score, 4),
             "distance": c.get("dist"),
+            "chroma_l2_distance": c.get("chroma_l2_distance"),
+            "cosine_distance": c.get("dist"),
             "rerank_score": c.get("rerank_score"),
+            "bm25_score": c.get("bm25_score"),
             "text": c["text"],
         })
 
@@ -1461,6 +1475,8 @@ def query_knowledge_base(
                     "raw_source": c["metadata"].get("source"),
                     "page": c["metadata"].get("page"),
                     "vector_rank": c.get("vector_rank"),
+                    "chroma_l2_distance": c.get("chroma_l2_distance"),
+                    "cosine_distance": c.get("dist"),
                     "bm25_rank": c.get("bm25_rank"),
                     "bm25_score": c.get("bm25_score"),
                     "rrf_score": round(c.get("rrf_score", 0.0), 4),

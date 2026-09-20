@@ -194,6 +194,16 @@ def _hydrate_message(msg: dict) -> dict:
     msg["coding_result"] = coding_res
     if coding_res and not msg.get("task_type"):
         msg["task_type"] = "CODING"
+    elif msg.get("sources") and not msg.get("task_type"):
+        msg["task_type"] = "RAG"
+
+    if msg.get("tool_calls") and isinstance(msg["tool_calls"], list):
+        for tc in msg["tool_calls"]:
+            if isinstance(tc, dict) and tc.get("tool") in ("rag_search", "search_kb") and tc.get("query"):
+                msg["retrieval_query"] = tc.get("query")
+                if not msg.get("task_type"):
+                    msg["task_type"] = "RAG"
+                break
     return msg
 
 

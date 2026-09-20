@@ -331,8 +331,8 @@ def normalize_query(query: str) -> NormalizedQuery:
         detected_topic = "recruitment_notice"
     # Priority 2: Refinery unit technical query
     elif found_units or (
-        "refinery" in found_ops
-        and any(op in found_ops for op in ["facilities", "manufacturing", "unit", "plant", "technology"])
+        ("refinery" in found_ops or has_mrpl)
+        and any(op in found_ops for op in ["facilities", "manufacturing", "unit", "plant", "technology", "process"])
     ):
         detected_topic = "refinery_unit"
     # Priority 3: Financial metric query

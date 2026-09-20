@@ -1,0 +1,84 @@
+# MRPL Sovereign AI Workbench — Multilingual Voice Assistant Configuration
+# Strict Sovereign On-Premise Execution — Zero Cloud Egress
+
+voice:
+  enabled: true
+  streaming_enabled: true
+  model_warmup: true
+  audio_sample_rate: 16000
+
+  # ── Speech-to-Text (ASR) ────────────────────────────────────────────────
+  asr:
+    provider: "local"
+    engine: "faster-whisper"
+    model_name: "tiny"
+    model_path: "models/whisper"
+    device: "cpu"
+    compute_type: "int8"
+    confidence_threshold: 0.55       # Pure acoustic token logprob threshold (tune 0.50-0.75)
+    local_files_only: true
+    partial_transcript_enabled: true
+
+  # ── Voice Activity Detection (VAD) & Barge-In ──────────────────────────
+  vad:
+    enabled: true
+    silence_threshold_ms: 500        # Silence duration to trigger end-of-speech (reduced to 500ms)
+    min_speech_duration_ms: 250      # Minimum audio duration to process
+    interruption_sensitivity: 0.025  # Amplitude threshold to detect barge-in during playback
+    energy_threshold: 0.02           # Speech vs silence energy threshold
+
+  # ── Language Detection ─────────────────────────────────────────────────
+  language_detection:
+    enabled: true
+    default: "auto"
+    supported_languages:
+      - code: "en"
+        name: "English"
+      - code: "hi"
+        name: "Hindi"
+      - code: "mr"
+        name: "Marathi"
+      - code: "kn"
+        name: "Kannada"
+
+  # ── ASR Quality Gate & Validation ──────────────────────────────────────
+  asr_quality_gate:
+    enabled: true
+    min_token_prob: 0.55             # Minimum average token probability
+    min_language_prob: 0.35          # Minimum language confidence
+    max_repetition_ngram_count: 3    # Maximum allowed identical n-grams before rejection
+    min_vocab_diversity: 0.40        # Minimum unique word ratio for runaway transcripts
+    supported_languages: ["en", "hi", "mr", "kn"]
+
+  # ── Fast Conversational Routing ────────────────────────────────────────
+  routing:
+    fast_path_enabled: true          # Fast direct Ollama path for simple conversational/conceptual queries
+    max_conversational_tokens: 256   # Concise responses optimized for speech
+    keep_alive: "30m"                # Keep conversational model warm in RAM/VRAM
+
+  # ── Text-to-Speech (TTS) & Streaming Buffer ─────────────────────────────
+  tts:
+    provider: "local"
+    engine: "sapi"                   # Windows SAPI (offline neural/local)
+    voice_rate: 165                  # Words per minute
+    voice_volume: 1.0                # 0.0 to 1.0
+    preserve_technical_terms: true
+    chunk_size: "clause"             # Natural phrase/clause streaming
+    sentence_pause_ms: 0             # Seamless continuous audio playback
+    min_chunk_words: 4               # Minimum words before synthesizing a clause
+    max_chunk_words: 25              # Maximum words per clause buffer
+
+  # ── Conversational Clarification ───────────────────────────────────────
+  clarification:
+    enabled: true
+    confidence_threshold: 0.55       # Pure acoustic token logprob threshold (tune 0.50-0.75)
+    auto_relisten: true               # Hands-free return to listening after speaking clarification question
+    enable_tag_disambiguation: true   # Auto-detect ambiguous equipment tags like 11-P-101
+
+  # ── Governance & Security ──────────────────────────────────────────────
+  security:
+    enforce_network_seal: true
+    store_raw_audio: false           # Never persist raw user voice files
+    require_grounded_tts: true       # Only speak verified / grounded responses
+    block_injection_in_voice: true
+

@@ -1,35 +1,105 @@
-﻿venv/
-backend/venv/
-env/
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+env/
+
+# Environment and Secrets
 .env
 .env.*
 *.key
 *.pem
-merged_knowledge_base/
-backend/chroma_db/
-chroma_db/
-*.sqlite3
-*.cache/
-.paddleocr/
-paddleocr_output/
+
+# Local models
+models/
 *.gguf
 *.bin
 *.safetensors
-data/
+
+# Local knowledge base
+merged_knowledge_base/
+
+# ChromaDB
+backend/chroma_db/
+chroma_db/
+*.sqlite3
+
+# Runtime data
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/uploads/
+data/temp_images/
 uploads/
 processed_docs/
+
+# Generated outputs
+outputs/
+
+# Scratch/debug
+scratch/
+
+# Logs
+*.log
+run_log.txt
+
+# Benchmarks
+benchmark_results.json
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+dist/
+node_modules/
+
+# Orchestration & Containers
 .n8n/
 n8n_data/
-*.log
 docker-data/
-.vscode/
-.idea/
+
+# OCR caches
+.paddleocr/
+paddleocr_output/
+
+# OS/editor
 .DS_Store
 Thumbs.db
 desktop.ini
-node_modules/
+.vscode/
+.idea/
+
+# Temporary / backups
 *.tmp
 *.bak
+*.cache/
+
+# Legacy data-prep / scraping scripts (local only)
+classify_other.py
+clean_kb.py
+clean_mrpl_kb.py
+backend/cleanup_knowledge_base.py
+backend/download_mrpl_technical.py
+backend/scrape_mrpl.py
+backend/rag.py
+backend/models.py
+backend/router.py
+backend/rag_service.py
+backend/test_scrapling.py
+
+# AI agent development rules (local only)
+.agent/
+
+# Unused frontend assets (local only)
+frontend/src/assets/hero.png
+frontend/src/assets/react.svg
+frontend/src/assets/vite.svg

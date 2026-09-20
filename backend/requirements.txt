@@ -1,0 +1,49 @@
+# MRPL Sovereign AI Workbench — Python Dependencies
+# All packages run on-premise, zero cloud dependency.
+
+# ── Web framework ────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# ── Authentication ───────────────────────────────────────────────────────
+argon2-cffi>=23.1.0
+
+# ── Database ─────────────────────────────────────────────────────────────
+# SQLite is built-in; no extra package needed.
+
+# ── LLM / Agent ──────────────────────────────────────────────────────────
+langchain-core>=0.3.0
+langgraph>=0.2.0
+langchain-ollama>=0.2.0
+
+# ── RAG / Embeddings ────────────────────────────────────────────────────
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# ── OCR ──────────────────────────────────────────────────────────────────
+paddleocr>=2.8.0
+paddlepaddle>=2.6.0
+
+# ── Document generation ─────────────────────────────────────────────────
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=1.0.0
+
+# ── System monitoring ───────────────────────────────────────────────────
+psutil>=6.0.0
+
+# ── Configuration ───────────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── HTTP client (for Ollama, n8n calls) ──────────────────────────────────
+requests>=2.32.0
+
+# ── PDF processing ──────────────────────────────────────────────────────
+PyMuPDF>=1.24.0
+
+# ── Docker sandbox ──────────────────────────────────────────────────────
+docker>=7.0.0
+
+# ── Reranking ────────────────────────────────────────────────────────
+# sentence-transformers handles cross-encoder reranking

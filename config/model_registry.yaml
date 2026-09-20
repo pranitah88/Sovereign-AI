@@ -1,4 +1,5 @@
 # config/model_registry.yaml
+
 models:
 
   - id: gemma3_4b
@@ -6,7 +7,16 @@ models:
     provider: ollama
     ollama_model_name: "gemma3:4b"
     endpoint: "http://127.0.0.1:11434/api/generate"
-    modality: ["text", "vision"]
+    version: "4b-instruct-q4_K_M"
+    approved: true
+    license: "Gemma Terms of Use"
+    license_type: "permissive_open"
+    approved_by: "MRPL IT Security & Governance Committee"
+    checksum: "sha256:4b11c97a8a10b42d7658c1482b53df90f"
+    description: "General reasoning, document synthesis, QA, and multimodal visual analysis."
+    modality:
+      - text
+      - vision
     max_context_window: 131072
     runtime_context_window: 8192
     vram_gb_estimate: 3.3
@@ -21,14 +31,24 @@ models:
       - drawing_understanding
       - synthesis
     priority: 1
-    notes: "Primary reasoning + multimodal model. Also used as synthesizer after tool calls, and as the classifier for the router itself."
+    notes: >
+      Primary reasoning and multimodal vision model.
+      Verified local Ollama runtime with native image and vision capabilities.
 
   - id: qwen25_coder_3b
     display_name: "Qwen 2.5 Coder 3B"
     provider: ollama
     ollama_model_name: "qwen2.5-coder:3b"
     endpoint: "http://127.0.0.1:11434/api/generate"
-    modality: ["text"]
+    version: "3b-instruct-q4_K_M"
+    approved: true
+    license: "Apache-2.0"
+    license_type: "open_source"
+    approved_by: "MRPL IT Security & Governance Committee"
+    checksum: "sha256:7f99d8b132a033f92025d0c752ebbc19a"
+    description: "Specialized model for Python code generation, calculation scripting, and unit analysis."
+    modality:
+      - text
     max_context_window: 32768
     runtime_context_window: 8192
     vram_gb_estimate: 1.9
@@ -39,36 +59,143 @@ models:
       - script_writing
       - calculation_scripting
     priority: 1
-    notes: "Specialist for code generation tasks. Output typically passed to sandbox for execution."
+    notes: >
+      Specialist for code generation and calculation scripting.
+      Output passed to Docker sandbox for isolated execution.
+
+  - id: qwen25_vl_3b
+    display_name: "Qwen 2.5 VL 3B"
+    provider: ollama
+    ollama_model_name: "qwen2.5-vl:3b"
+    endpoint: "http://127.0.0.1:11434/api/generate"
+    version: "3b-instruct"
+    approved: true
+    license: "Apache-2.0"
+    license_type: "open_source"
+    approved_by: "MRPL IT Security & Governance Committee"
+    checksum: "sha256:qwen25vl3b_verified"
+    description: "Specialized multimodal vision model for P&ID engineering drawings and equipment tag extraction."
+    modality:
+      - text
+      - vision
+    max_context_window: 32768
+    runtime_context_window: 8192
+    vram_gb_estimate: 2.2
+    enabled: true
+    task_tags:
+      - image_understanding
+      - drawing_understanding
+      - pid_verification
+      - equipment_tag_extraction
+    priority: 1
+    notes: >
+      Configured specialist for engineering drawings and P&ID verification.
 
 task_type_routing:
 
-  general_reasoning:
-    preferred_tags: ["general_reasoning", "qa"]
+  CODING:
+    preferred_tags:
+      - code_generation
+      - script_writing
+    required_tools:
+      - sandbox_execute
+    requires_rag: false
+    requires_sandbox: true
+
+  HYBRID:
+    preferred_tags:
+      - code_generation
+      - calculation_scripting
+    required_tools:
+      - rag_search
+      - sandbox_execute
+    requires_rag: true
+    requires_sandbox: true
+
+  RAG:
+    preferred_tags:
+      - general_reasoning
+      - qa
+    required_tools:
+      - rag_search
+    requires_rag: true
+    requires_sandbox: false
+
+  GENERAL:
+    preferred_tags:
+      - general_reasoning
+    required_tools: []
+    requires_rag: false
+    requires_sandbox: false
+
+  VISION:
+    preferred_tags:
+      - image_understanding
+      - drawing_understanding
+    required_tools: []
+    requires_rag: false
+    requires_sandbox: false
+
+  DOCUMENT_ANALYSIS:
+    preferred_tags:
+      - document_summary
+      - findings_extraction
+    required_tools:
+      - rag_search
+    requires_rag: true
+    requires_sandbox: false
+
+  general_chat:
+    preferred_tags:
+      - general_reasoning
     required_tools: []
 
+  general_reasoning:
+    preferred_tags:
+      - general_reasoning
+      - qa
+    required_tools:
+      - rag_search
+
   document_summary:
-    preferred_tags: ["document_summary", "findings_extraction"]
-    required_tools: ["rag_search"]
+    preferred_tags:
+      - document_summary
+      - findings_extraction
+    required_tools:
+      - rag_search
 
   approval_note:
-    preferred_tags: ["approval_note_drafting", "document_summary"]
-    required_tools: ["rag_search", "docgen_docx"]
+    preferred_tags:
+      - approval_note_drafting
+      - document_summary
+    required_tools:
+      - rag_search
+      - docgen_docx
 
   code_generation:
-    preferred_tags: ["code_generation", "script_writing"]
-    required_tools: ["sandbox_execute"]
+    preferred_tags:
+      - code_generation
+      - script_writing
+    required_tools:
+      - sandbox_execute
 
   calculation:
-    preferred_tags: ["calculation_scripting", "code_generation"]
-    required_tools: ["sandbox_execute"]
+    preferred_tags:
+      - calculation_scripting
+      - code_generation
+    required_tools:
+      - sandbox_execute
 
   image_or_drawing_understanding:
-    preferred_tags: ["image_understanding", "drawing_understanding"]
+    preferred_tags:
+      - image_understanding
+      - drawing_understanding
     required_tools: []
 
   synthesis:
-    preferred_tags: ["synthesis", "general_reasoning"]
+    preferred_tags:
+      - synthesis
+      - general_reasoning
     required_tools: []
 
 tools:
@@ -76,23 +203,38 @@ tools:
   - id: rag_search
     display_name: "Local Knowledge Base (RAG)"
     endpoint: "http://127.0.0.1:8001/rag/query"
-    description: "Retrieves relevant chunks from ChromaDB knowledge base."
+    description: >
+      Retrieves relevant chunks from the local ChromaDB
+      knowledge base.
     enabled: true
 
   - id: ocr_extract
     display_name: "PaddleOCR Extraction"
     endpoint: "http://127.0.0.1:8001/ocr/extract"
-    description: "Extracts text from scanned/printed PDF pages or images."
+    description: >
+      Extracts text from scanned or printed PDF pages
+      and images.
     enabled: true
 
   - id: sandbox_execute
     display_name: "Code Sandbox"
     endpoint: "http://127.0.0.1:8002/sandbox/execute"
-    description: "Executes code in an isolated Docker container and returns stdout/stderr/result."
+    description: >
+      Executes code in an isolated Docker container with network
+      disabled, read-only filesystem, non-root user, and hard
+      resource limits. Returns stdout, stderr, and exit code.
     enabled: true
 
   - id: docgen_docx
     display_name: "DOCX Generator"
     endpoint: "http://127.0.0.1:8003/docgen/docx"
-    description: "Generates a Word document from structured content."
+    description: >
+      Generates a Word document from structured content.
     enabled: true
+
+  - id: docgen_pdf
+    display_name: "PDF Generator"
+    endpoint: "http://127.0.0.1:8003/docgen/pdf"
+    description: >
+      Generates a formal technical PDF report using ReportLab.
+    enabled: true

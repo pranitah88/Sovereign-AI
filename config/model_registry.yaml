@@ -1,0 +1,98 @@
+# config/model_registry.yaml
+models:
+
+  - id: gemma3_4b
+    display_name: "Gemma 3 4B"
+    provider: ollama
+    ollama_model_name: "gemma3:4b"
+    endpoint: "http://127.0.0.1:11434/api/generate"
+    modality: ["text", "vision"]
+    max_context_window: 131072
+    runtime_context_window: 8192
+    vram_gb_estimate: 3.3
+    enabled: true
+    task_tags:
+      - general_reasoning
+      - document_summary
+      - qa
+      - approval_note_drafting
+      - findings_extraction
+      - image_understanding
+      - drawing_understanding
+      - synthesis
+    priority: 1
+    notes: "Primary reasoning + multimodal model. Also used as synthesizer after tool calls, and as the classifier for the router itself."
+
+  - id: qwen25_coder_3b
+    display_name: "Qwen 2.5 Coder 3B"
+    provider: ollama
+    ollama_model_name: "qwen2.5-coder:3b"
+    endpoint: "http://127.0.0.1:11434/api/generate"
+    modality: ["text"]
+    max_context_window: 32768
+    runtime_context_window: 8192
+    vram_gb_estimate: 1.9
+    enabled: true
+    task_tags:
+      - code_generation
+      - code_explanation
+      - script_writing
+      - calculation_scripting
+    priority: 1
+    notes: "Specialist for code generation tasks. Output typically passed to sandbox for execution."
+
+task_type_routing:
+
+  general_reasoning:
+    preferred_tags: ["general_reasoning", "qa"]
+    required_tools: []
+
+  document_summary:
+    preferred_tags: ["document_summary", "findings_extraction"]
+    required_tools: ["rag_search"]
+
+  approval_note:
+    preferred_tags: ["approval_note_drafting", "document_summary"]
+    required_tools: ["rag_search", "docgen_docx"]
+
+  code_generation:
+    preferred_tags: ["code_generation", "script_writing"]
+    required_tools: ["sandbox_execute"]
+
+  calculation:
+    preferred_tags: ["calculation_scripting", "code_generation"]
+    required_tools: ["sandbox_execute"]
+
+  image_or_drawing_understanding:
+    preferred_tags: ["image_understanding", "drawing_understanding"]
+    required_tools: []
+
+  synthesis:
+    preferred_tags: ["synthesis", "general_reasoning"]
+    required_tools: []
+
+tools:
+
+  - id: rag_search
+    display_name: "Local Knowledge Base (RAG)"
+    endpoint: "http://127.0.0.1:8001/rag/query"
+    description: "Retrieves relevant chunks from ChromaDB knowledge base."
+    enabled: true
+
+  - id: ocr_extract
+    display_name: "PaddleOCR Extraction"
+    endpoint: "http://127.0.0.1:8001/ocr/extract"
+    description: "Extracts text from scanned/printed PDF pages or images."
+    enabled: true
+
+  - id: sandbox_execute
+    display_name: "Code Sandbox"
+    endpoint: "http://127.0.0.1:8002/sandbox/execute"
+    description: "Executes code in an isolated Docker container and returns stdout/stderr/result."
+    enabled: true
+
+  - id: docgen_docx
+    display_name: "DOCX Generator"
+    endpoint: "http://127.0.0.1:8003/docgen/docx"
+    description: "Generates a Word document from structured content."
+    enabled: true

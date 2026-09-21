@@ -12,35 +12,35 @@ The Sovereign AI Workbench eliminates cloud dependency entirely. It runs a compl
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    React Frontend (Vite)                     │
+│                    React Frontend (Vite)                    │
 │           Chat · Dashboard · Documents · Admin · Audit      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ REST API
 ┌──────────────────────────▼──────────────────────────────────┐
-│                  FastAPI Backend (Uvicorn)                   │
+│                  FastAPI Backend (Uvicorn)                  │
 │                                                             │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-│  │ Auth (RBAC) │  │ Agent Graph  │  │ Security Guards    │ │
-│  │ JWT/Session │  │ (LangGraph)  │  │ Scope · Temporal · │ │
-│  │ 4 Roles     │  │ Multi-step   │  │ Confidence · Net   │ │
-│  └─────────────┘  └──────┬───────┘  └────────────────────┘ │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
+│  │ Auth (RBAC) │  │ Agent Graph  │  │ Security Guards    │  │
+│  │ JWT/Session │  │ (LangGraph)  │  │ Scope · Temporal · │  │
+│  │ 4 Roles     │  │ Multi-step   │  │ Confidence · Net   │  │
+│  └─────────────┘  └──────┬───────┘  └────────────────────┘  │
 │                          │                                  │
 │  ┌───────────────────────▼────────────────────────────────┐ │
 │  │              Hybrid RAG Engine                         │ │
-│  │   ChromaDB (vectors) + BM25 (lexical) + Reranking     │ │
-│  │   Pre-LLM clearance filtering · Citation validation   │ │
+│  │   ChromaDB (vectors) + BM25 (lexical) + Reranking      │ │
+│  │   Pre-LLM clearance filtering · Citation validation    │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                                                             │
-│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐ │
-│  │ Sandbox  │  │ Voice     │  │ Vision   │  │ DocGen    │ │
-│  │ (Docker) │  │ ASR + TTS │  │ OCR/VL   │  │ DOCX/XLSX │ │
-│  └──────────┘  └───────────┘  └──────────┘  └───────────┘ │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐   │
+│  │ Sandbox  │  │ Voice     │  │ Vision   │  │ DocGen    │   │
+│  │ (Docker) │  │ ASR + TTS │  │ OCR/VL   │  │ DOCX/XLSX │   │
+│  └──────────┘  └───────────┘  └──────────┘  └───────────┘   │
 └──────────────────────────┬──────────────────────────────────┘
                            │ localhost:11434
               ┌────────────▼────────────────┐
               │     Ollama (Local LLMs)     │
-              │  Gemma 3 4B · Qwen 2.5     │
-              │  Coder 3B · Qwen 2.5 VL 3B │
+              │  Gemma 3 4B · Qwen 2.5      │
+              │  Coder 3B · Qwen 2.5 VL 3B  │
               └─────────────────────────────┘
 ```
 

@@ -74,6 +74,14 @@ HINDI_MARKERS = [
 ]
 
 
+def _match_devanagari_marker(marker: str, text: str) -> bool:
+    clean = marker.replace(r"\b", "").strip()
+    if not clean:
+        return False
+    pattern = rf"(?:^|[^\u0900-\u097fa-zA-Z0-9]){re.escape(clean)}(?:$|[^\u0900-\u097fa-zA-Z0-9])"
+    return bool(re.search(pattern, text))
+
+
 def detect_language(query: str) -> str:
     """
     Detect whether query is Hindi, Marathi, or English.
@@ -84,8 +92,8 @@ def detect_language(query: str) -> str:
         return "english"
 
     q_lower = query.lower()
-    marathi_score = sum(1 for m in MARATHI_MARKERS if re.search(m, q_lower))
-    hindi_score = sum(1 for m in HINDI_MARKERS if re.search(m, q_lower))
+    marathi_score = sum(1 for m in MARATHI_MARKERS if _match_devanagari_marker(m, q_lower))
+    hindi_score = sum(1 for m in HINDI_MARKERS if _match_devanagari_marker(m, q_lower))
 
     if marathi_score > hindi_score:
         return "marathi"

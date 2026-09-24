@@ -953,6 +953,18 @@ select.input {
   font-size: 0.7rem;
   color: var(--text-secondary);
   overflow-x: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.trace-step-icon,
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
 }
 
 .trace-step {
@@ -960,6 +972,8 @@ select.input {
   align-items: center;
   gap: 4px;
   font-weight: 500;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .trace-step.active {
@@ -970,6 +984,8 @@ select.input {
 .trace-arrow {
   color: var(--text-tertiary);
   font-size: 0.65rem;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* ── Sources Citation Box ───────────────────────────────────────────── */
@@ -3940,6 +3956,92 @@ select.input {
   background: #9f1239;
 }
 
+/* Acoustic Diagnostics Section */
+.voice-modal-diagnostics-section {
+  width: 100%;
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
+.btn-toggle-diagnostics {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-toggle-diagnostics:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.voice-diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+  padding: 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  animation: fadeIn 0.2s ease-in;
+}
+
+.diag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 5px 8px;
+  text-align: left;
+}
+
+.diag-card-label {
+  font-size: 0.60rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #64748b;
+}
+
+.diag-card-val {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #0f172a;
+  font-family: monospace;
+}
+
+.diag-card-val.val-good {
+  color: #059669;
+}
+
+.diag-card-val.val-warn {
+  color: #d97706;
+}
+
+.diag-card-val.val-active {
+  color: #16a34a;
+}
+
+.diag-card-val.val-idle {
+  color: #64748b;
+}
+
+.diag-card-val.val-opt {
+  color: #2563eb;
+}
+
 /* Modal Footer */
 .voice-modal-footer {
   padding: 14px 20px;
@@ -4476,6 +4578,199 @@ select.input {
     grid-template-columns: 1fr;
     gap: 4px;
   }
+}
+
+/* ── Nova Voice Assistant & Normal Voice-to-Text Styles ──────────────── */
+.voice-mode-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.btn-mode-nova {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #1b4332;
+  color: #ffffff;
+  border: 1px solid #2d6a4f;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  box-shadow: 0 1px 3px rgba(27, 67, 50, 0.2);
+}
+
+.btn-mode-nova:hover {
+  background: #2d6a4f;
+  border-color: #40916c;
+  transform: translateY(-1px);
+}
+
+.btn-mode-nova.active {
+  background: #dc2626;
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(220, 38, 38, 0.4);
+}
+
+@keyframes pulse-border {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+.pulsing-dot-red {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #ffffff;
+  animation: pulse-red 1s infinite;
+}
+
+@keyframes pulse-red {
+  0% { transform: scale(0.95); opacity: 0.7; }
+  50% { transform: scale(1.2); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.7; }
+}
+
+/* Stop Assistant Header Button */
+.btn-stop-assistant-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #dc2626;
+  color: #ffffff;
+  border: 1px solid #b91c1c;
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 3px rgba(220, 38, 38, 0.25);
+}
+
+.btn-stop-assistant-header:hover {
+  background: #b91c1c;
+}
+
+/* Stop Assistant Footer Button */
+.btn-stop-assistant {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  max-width: 220px;
+  background: #dc2626;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.25);
+}
+
+.btn-stop-assistant:hover {
+  background: #b91c1c;
+  transform: translateY(-1px);
+}
+
+/* Voice-to-Text Live Preview Bar */
+.vtt-live-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: 8px;
+  padding: 8px 14px;
+  margin-bottom: 8px;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.1);
+  animation: slideInDown 0.2s ease-out;
+}
+
+@keyframes slideInDown {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.vtt-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+  color: #166534;
+}
+
+.vtt-status-label {
+  background: #dcfce7;
+  border: 1px solid #bbf7d0;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #15803d;
+  letter-spacing: 0.04em;
+}
+
+.vtt-preview-text {
+  flex: 1;
+  font-size: 0.84rem;
+  color: #1e293b;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vtt-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-vtt-done {
+  background: #15803d;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-vtt-done:hover {
+  background: #166534;
+}
+
+.btn-vtt-cancel {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-vtt-cancel:hover {
+  background: #e2e8f0;
+  color: #1e293b;
 }
 
 

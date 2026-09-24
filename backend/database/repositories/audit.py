@@ -45,7 +45,22 @@ def write_log(
             """,
             (user_id, username, action, target, outcome, details_json, ip_address),
         )
+        if cursor.lastrowid is None:
+            raise RuntimeError("Failed to obtain lastrowid after audit log insert")
         return cursor.lastrowid
+
+
+def _normalize_filter_str(val: str | None) -> str | None:
+    """
+    Normalize string filter value: empty string or whitespace-only -> None.
+    Preserves exact casing for non-empty filters.
+    """
+    if val is None:
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        return stripped if stripped else None
+    return str(val)
 
 
 def query_logs(
@@ -64,6 +79,11 @@ def query_logs(
     Dates should be ISO-8601 format (e.g. '2026-01-01T00:00:00Z').
     Returns newest-first.
     """
+    action = _normalize_filter_str(action)
+    outcome = _normalize_filter_str(outcome)
+    start_date = _normalize_filter_str(start_date)
+    end_date = _normalize_filter_str(end_date)
+
     conditions = []
     params = []
 
@@ -88,7 +108,7 @@ def query_logs(
     query = f"""
         SELECT * FROM audit_logs
         {where_clause}
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ? OFFSET ?
     """
     params.extend([limit, offset])
@@ -113,6 +133,11 @@ def count_logs(
     end_date: str | None = None,
 ) -> int:
     """Count audit log entries matching the given filters."""
+    action = _normalize_filter_str(action)
+    outcome = _normalize_filter_str(outcome)
+    start_date = _normalize_filter_str(start_date)
+    end_date = _normalize_filter_str(end_date)
+
     conditions = []
     params = []
 

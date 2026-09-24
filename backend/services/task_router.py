@@ -30,7 +30,7 @@ def _load_registry() -> dict:
         _registry = yaml.safe_load(f)
 
     logger.info("Loaded model registry from %s", _REGISTRY_PATH)
-    return _registry
+    return _registry or {}
 
 
 def reload_registry() -> dict:
@@ -97,6 +97,38 @@ def select_vision_model() -> dict:
     return validate_model_selection("gemma3_4b")
 
 
+DOC_REFERENCE_PATTERNS = [
+    r"\b(?:this|the|that|attached|uploaded)\s+(?:pdf|document|doc|file|report|manual)\b",
+    r"\bwhat\s+does\s+(?:this|the|that|attached|uploaded)?\s*(?:pdf|document|file|report)\s+say\b",
+    r"\b(?:summarize|analyze|review|explain)\s+(?:this|the|that|attached|uploaded)?\s*(?:pdf|document|doc|file|report)\b",
+    r"\bexplain\s+page\s+\d+\b",
+    r"\b(?:page\s+\d+\s+of|from\s+page\s+\d+)\b",
+    r"\b(?:from|in)\s+(?:this|the\s+uploaded|the\s+attached)\s+(?:document|pdf|file|report)\b",
+    r"\b(?:executive\s+summary|document\s+summary|table\s+of\s+contents)\b",
+]
+
+
+def check_document_analysis_intent(text: str, target_doc: str | None = None, has_scanned_pdf: bool = False) -> bool:
+    """
+    Determine if current query has genuine document analysis intent.
+    Rule 3: ATTACHMENT PRESENCE != DOCUMENT ANALYSIS INTENT.
+    CURRENT USER QUERY is authoritative for TASK INTENT.
+    """
+    if not text:
+        return bool(has_scanned_pdf)
+    text_lower = text.lower()
+    has_doc_kw = any(kw in text_lower for kw in ["analyze", "analysis", "summarize", "summary", "breakdown", "review"])
+    has_doc_ref = any(bool(re.search(p, text_lower)) for p in DOC_REFERENCE_PATTERNS)
+
+    if target_doc and (has_doc_kw or any(w in text_lower for w in ["explain", "read", "findings", "report", "page", "what does", "generate"])):
+        return True
+    if has_doc_ref and (has_doc_kw or any(w in text_lower for w in ["explain", "read", "findings", "report", "say", "what does", "extract", "generate", "make"])):
+        return True
+    if has_scanned_pdf and (has_doc_ref or has_doc_kw):
+        return True
+    return False
+
+
 def _raw_route_task(
     user_request: str,
     has_image: bool = False,
@@ -124,7 +156,9 @@ def _raw_route_task(
         }
 
     # 2. Scanned PDF / Document OCR
-    if has_scanned_pdf:
+    # Hard Rule 3: ATTACHMENT PRESENCE != DOCUMENT ANALYSIS INTENT
+    # Scanned PDF availability only routes to DOCUMENT_ANALYSIS if current query requests an operation on it.
+    if has_scanned_pdf and check_document_analysis_intent(text, target_doc=None, has_scanned_pdf=True):
         model_entry = validate_model_selection("gemma3_4b")
         return {
             "task_type": "DOCUMENT_ANALYSIS",
@@ -132,10 +166,48 @@ def _raw_route_task(
             "model_id": model_entry["id"],
             "requires_rag": True,
             "requires_sandbox": False,
-            "reason": "Input includes a scanned PDF requiring OCR extraction and document analysis.",
+            "reason": "Input includes a scanned PDF with explicit document analysis intent.",
             "tools": ["rag_search", "ocr_extract"],
             "endpoint": model_entry["endpoint"],
         }
+
+    # 2b. Deterministic Query Completeness & Ambiguity Check
+    from backend.services.voice.clarification import check_query_completeness, check_ambiguous_entity
+    is_incomplete, inc_reason = check_query_completeness(text)
+    is_ambig_ent, amb_reason, candidate_entities = check_ambiguous_entity(text)
+
+    if is_incomplete:
+        model_entry = validate_model_selection("gemma3_4b")
+        if is_ambig_ent:
+            q = "Could you complete your question? Also, do you mean MRP or MRPL?"
+            return {
+                "task_type": "CLARIFICATION",
+                "model": model_entry["ollama_model_name"],
+                "model_id": model_entry["id"],
+                "requires_rag": False,
+                "requires_sandbox": False,
+                "reason": "Utterance appears incomplete and contains ambiguous entity (MRP vs MRPL); clarification required.",
+                "tools": [],
+                "endpoint": model_entry["endpoint"],
+                "clarification_question": q,
+                "ambiguity_type": "incomplete_ambiguous",
+                "status": "CLARIFICATION_REQUIRED",
+            }
+        else:
+            q = "Could you please complete your question?"
+            return {
+                "task_type": "INCOMPLETE_QUERY",
+                "model": model_entry["ollama_model_name"],
+                "model_id": model_entry["id"],
+                "requires_rag": False,
+                "requires_sandbox": False,
+                "reason": f"Utterance appears incomplete ({inc_reason}); clarification required.",
+                "tools": [],
+                "endpoint": model_entry["endpoint"],
+                "clarification_question": q,
+                "ambiguity_type": "incomplete_query",
+                "status": "INCOMPLETE_QUERY",
+            }
 
     # 3. Conversational / Casual Greeting
     greeting_patterns = [
@@ -160,14 +232,16 @@ def _raw_route_task(
 
     # 4. Conceptual / Educational Explanation (e.g. "Explain what Python is")
     # Must precede coding check so "explain what python is" does not get classified as coding.
+    # Must NOT match document analysis queries (e.g. "Explain the document", "Explain page 5 of TranscriptSd.pdf")
     is_conceptual = bool(re.search(
         r"^\s*(explain\s+(what\s+)?|what\s+is\s+|define\s+|describe\s+|tell\s+me\s+about\s+)",
         text_lower,
     )) and not any(kw in text_lower for kw in [
         "write", "create", "generate", "implement", "build", "script to", "code to", "function to", "calculate", "compute"
     ]) and not any(kw in text_lower for kw in [
-        "mrpl", "refinery", "annual report", "balance sheet", "hydrocracker", "fccu", "cdu", "vdu", "om&s", "p&l"
-    ])
+        "mrpl", "refinery", "annual report", "balance sheet", "hydrocracker", "fccu", "cdu", "vdu", "om&s", "p&l",
+        "document", "pdf", "file", "report", "manual", "transcript", "page",
+    ]) and not check_document_analysis_intent(text, target_doc=None, has_scanned_pdf=has_scanned_pdf)
     if is_conceptual:
         model_entry = validate_model_selection("gemma3_4b")
         return {
@@ -333,39 +407,37 @@ def _raw_route_task(
             pass
 
     doc_deliverable_pdf_patterns = [
-        r"\b(create|generate|make|give|download|export|save|send|convert|provide|get|build|print)\b.*\bpdf\b",
-        r"\bpdf\b.*\b(create|generate|make|give|download|export|save|send|convert|provide|get|build|print)\b",
-        r"\bpdf\s+(of\s+it|of\s+this|of\s+that|of\s+the|file|document|doc|report|format|form|version|deliverable|copy)\b",
-        r"\b(in|as|to|into|a|the)\s+pdf\b",
+        r"\b(create|generate|make|download|export|save|send|convert|build|print)\b.*\bpdf\b",
+        r"\bpdf\b.*\b(create|generate|make|download|export|save|send|convert|build|print)\b",
+        r"\bpdf\s+(?:report|format|form|version|deliverable)\b",
+        r"\b(?:in|as|into)\s+(?:a\s+|the\s+)?pdf\b",
         r"^\s*pdf\s*$",
         r"\b(pdf\s+form|in\s+pdf|as\s+pdf|pdf\s+format|pdf\s+report|download\s+pdf|export.*pdf|generate.*pdf)\b",
         r"\b(give.*report.*in\s+pdf|analysis\s+report\s+in\s+pdf)\b",
     ]
     doc_deliverable_docx_patterns = [
-        r"\b(create|generate|make|give|download|export|save|send|convert|provide|get|build|print)\b.*\b(docx|doc|word)\b",
-        r"\b(docx|word)\b.*\b(create|generate|make|give|download|export|save|send|convert|provide|get|build|print)\b",
-        r"\b(docx|word)\s+(of\s+it|of\s+this|of\s+that|of\s+the|file|document|doc|report|format|form|version|deliverable|copy)\b",
-        r"\b(in|as|to|into|a|the)\s+(docx|word)\b",
+        r"\b(create|generate|make|download|export|save|send|convert|build|print)\b.*\b(docx|word)\b",
+        r"\b(docx|word)\b.*\b(create|generate|make|download|export|save|send|convert|build|print)\b",
+        r"\b(docx|word)\s+(?:format|form|version|deliverable|report)\b",
+        r"\b(?:in|as|into)\s+(?:a\s+|the\s+)?(docx|word)\b",
         r"^\s*(docx|word)\s*$",
         r"\b(docx\s+form|in\s+docx|as\s+docx|docx\s+format|docx\s+report|download\s+docx|export.*docx|generate.*docx|in\s+word|word\s+format)\b",
         r"\b(give.*report.*in\s+docx|analysis\s+report\s+in\s+docx)\b",
     ]
     generic_deliverable_patterns = [
-        r"\b(give\s+the\s+analysis\s+report|give\s+me\s+the\s+analysis\s+report|give\s+the\s+report|generate\s+the\s+analysis\s+report|generate\s+the\s+report)\b",
-        r"^\s*(give+|where\s+is\s+it|show\s+it|download\s+it|give\s+it|give\s+me)\b",
-    ]
-    doc_analysis_patterns = [
-        r"\b(analyze|analysis\s+of|summarize|summary\s+of|breakdown\s+of)\b",
-        r"\b(give\s+the\s+analysis|give\s+me\s+the\s+analysis)\b",
-        r"\b(summarize\s+the\s+document|summarize\s+this\s+report|executive\s+summary)\b",
+        r"\b(generate|create|download|export|prepare|build)\s+(?:an?\s+|the\s+)?(?:analysis\s+report|summary\s+report|document\s+report|deliverable\s+report)\b",
+        r"\b(give|show|send)\s+(?:me\s+)?(?:the\s+)?(?:analysis\s+report|summary\s+report|document\s+report|deliverable\s+file)\b",
+        r"^\s*(?:where\s+is|show|download|give)\s+(?:the\s+)?(?:report|deliverable|analysis\s+report|pdf\s+report)\b",
     ]
 
-    is_pdf_deliverable = any(bool(re.search(p, text_lower)) for p in doc_deliverable_pdf_patterns)
-    is_docx_deliverable = any(bool(re.search(p, text_lower)) for p in doc_deliverable_docx_patterns)
-    is_generic_deliverable = any(bool(re.search(p, text_lower)) for p in generic_deliverable_patterns)
-    is_doc_analysis = any(bool(re.search(p, text_lower)) for p in doc_analysis_patterns) or bool(
-        target_doc and any(w in text_lower for w in ["analyze", "analysis", "summary", "summarize", "report"])
+    is_doc_analysis = check_document_analysis_intent(text, target_doc=target_doc, has_scanned_pdf=has_scanned_pdf)
+    is_pdf_deliverable = any(bool(re.search(p, text_lower)) for p in doc_deliverable_pdf_patterns) and (
+        bool(target_doc) or has_scanned_pdf or is_doc_analysis or any(kw in text_lower for kw in ["pdf", "report", "document"])
     )
+    is_docx_deliverable = any(bool(re.search(p, text_lower)) for p in doc_deliverable_docx_patterns) and (
+        bool(target_doc) or has_scanned_pdf or is_doc_analysis or any(kw in text_lower for kw in ["docx", "word", "report", "document"])
+    )
+    is_generic_deliverable = any(bool(re.search(p, text_lower)) for p in generic_deliverable_patterns)
 
     if is_pdf_deliverable:
         model_entry = validate_model_selection("gemma3_4b")
@@ -414,6 +486,7 @@ def _raw_route_task(
 
     if is_doc_analysis:
         model_entry = validate_model_selection("gemma3_4b")
+        tools = ["rag_search", "ocr_extract"] if has_scanned_pdf else ["rag_search"]
         return {
             "task_type": "DOCUMENT_ANALYSIS",
             "model": model_entry["ollama_model_name"],
@@ -421,7 +494,7 @@ def _raw_route_task(
             "requires_rag": True,
             "requires_sandbox": False,
             "reason": "Document analysis request requiring knowledge base retrieval.",
-            "tools": ["rag_search"],
+            "tools": tools,
             "endpoint": model_entry["endpoint"],
             "target_document": target_doc,
         }
@@ -498,6 +571,10 @@ def _enrich_decision(d: dict) -> dict:
             {"model": "gemma3:4b", "model_id": "gemma3_4b", "score": 0.96, "selected": model_id == "gemma3_4b", "license": "Gemma Terms of Use", "task": "document_analysis"},
             {"model": "qwen2.5-coder:3b", "model_id": "qwen25_coder_3b", "score": 0.30, "selected": False, "license": "Apache-2.0", "task": "coding_execution"},
         ]
+    elif task_type in ("CLARIFICATION", "INCOMPLETE_QUERY", "AMBIGUOUS_QUERY"):
+        d["candidates"] = [
+            {"model": "gemma3:4b", "model_id": "gemma3_4b", "score": 0.95, "selected": True, "license": "Gemma Terms of Use", "task": "clarification"},
+        ]
     else:  # RAG, GENERAL
         d["candidates"] = [
             {"model": "gemma3:4b", "model_id": "gemma3_4b", "score": 0.94, "selected": model_id == "gemma3_4b", "license": "Gemma Terms of Use", "task": "dense_retrieval_reasoning"},
@@ -528,24 +605,46 @@ def route_task(
     # When a follow-up is detected, ask the existing conversational-context resolver
     # whether a valid previous knowledge subject exists. Only promote to RAG when
     # that resolver returns a concrete subject/retrieval context.
-    if (not raw_decision.get("requires_rag", False) or raw_decision.get("task_type") == "GENERAL") and conversation_history:
+    # INCOMPLETE/CLARIFICATION queries must NEVER be promoted to RAG!
+    if (raw_decision.get("task_type") not in ("CLARIFICATION", "INCOMPLETE_QUERY", "AMBIGUOUS_QUERY")) and (not raw_decision.get("requires_rag", False) or raw_decision.get("task_type") == "GENERAL") and conversation_history:
         try:
             from backend.services.voice.context_policy import determine_conversational_context
             ctx = determine_conversational_context(
                 current_query=user_request,
                 conversation_history=conversation_history,
             )
-            if ctx.is_followup and (ctx.target_entity or (ctx.resolved_retrieval_query and ctx.resolved_retrieval_query.strip().lower() != user_request.strip().lower())):
-                model_entry, tools = select_model_and_tools("RAG", has_image=has_image, has_scanned_pdf=has_scanned_pdf)
-                raw_decision["task_type"] = "RAG"
-                raw_decision["requires_rag"] = True
-                raw_decision["reason"] = f"Conversational follow-up resolved to structured subject: {ctx.target_entity or ctx.resolved_retrieval_query}"
-                raw_decision["model"] = model_entry["ollama_model_name"]
-                raw_decision["model_id"] = model_entry["id"]
-                raw_decision["endpoint"] = model_entry["endpoint"]
-                raw_decision["tools"] = tools
-                raw_decision["retrieval_query"] = ctx.resolved_retrieval_query
-                raw_decision["target_entity"] = ctx.target_entity
+            if ctx.is_followup:
+                prev_task = None
+                if conversation_history:
+                    for msg in reversed(conversation_history):
+                        if msg.get("task_type"):
+                            prev_task = msg.get("task_type")
+                            break
+                is_doc_followup = (prev_task == "DOCUMENT_ANALYSIS") and (
+                    check_document_analysis_intent(user_request)
+                    or bool(re.search(r'\b(the\s+document|the\s+pdf|the\s+report|the\s+findings|page\s+\d+|it|its)\b', user_request.lower()))
+                )
+                if is_doc_followup and ctx.target_entity:
+                    model_entry = validate_model_selection("gemma3_4b")
+                    raw_decision["task_type"] = "DOCUMENT_ANALYSIS"
+                    raw_decision["requires_rag"] = True
+                    raw_decision["reason"] = f"Conversational document follow-up resolved to: {ctx.target_entity}"
+                    raw_decision["model"] = model_entry["ollama_model_name"]
+                    raw_decision["model_id"] = model_entry["id"]
+                    raw_decision["endpoint"] = model_entry["endpoint"]
+                    raw_decision["tools"] = ["rag_search"]
+                    raw_decision["target_document"] = ctx.target_entity
+                elif ctx.target_entity or (ctx.resolved_retrieval_query and ctx.resolved_retrieval_query.strip().lower() != user_request.strip().lower()):
+                    model_entry, tools = select_model_and_tools("RAG", has_image=has_image, has_scanned_pdf=has_scanned_pdf)
+                    raw_decision["task_type"] = "RAG"
+                    raw_decision["requires_rag"] = True
+                    raw_decision["reason"] = f"Conversational follow-up resolved to structured subject: {ctx.target_entity or ctx.resolved_retrieval_query}"
+                    raw_decision["model"] = model_entry["ollama_model_name"]
+                    raw_decision["model_id"] = model_entry["id"]
+                    raw_decision["endpoint"] = model_entry["endpoint"]
+                    raw_decision["tools"] = tools
+                    raw_decision["retrieval_query"] = ctx.resolved_retrieval_query
+                    raw_decision["target_entity"] = ctx.target_entity
         except Exception as err:
             logger.warning("Conversational context resolution in task router failed: %s", err)
 
@@ -582,6 +681,12 @@ def classify_task_type(
         res["retrieval_query"] = decision["retrieval_query"]
     if "target_entity" in decision:
         res["target_entity"] = decision["target_entity"]
+    if "clarification_question" in decision:
+        res["clarification_question"] = decision["clarification_question"]
+    if "ambiguity_type" in decision:
+        res["ambiguity_type"] = decision["ambiguity_type"]
+    if "status" in decision:
+        res["status"] = decision["status"]
     return res
 
 

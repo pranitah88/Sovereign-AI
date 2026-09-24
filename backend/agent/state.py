@@ -37,6 +37,14 @@ class AgentState:
     has_scanned_pdf: bool = False
     user: dict | None = None
 
+    # ── Vision Analysis State ────────────────────────────────────────────
+    vision_status: str = ""    # VISION_ANALYSIS_COMPLETED / VISION_ANALYSIS_FAILED / VISION_OCR_FALLBACK / VISION_NOT_APPLICABLE
+    vision_error: str = ""     # Original error from vision model (preserved for tracing)
+
+    # ── Clarification & Ambiguity State ──────────────────────────────────
+    clarification_question: str = ""
+    ambiguity_type: str = ""
+
     def __post_init__(self) -> None:
         if self.current_user_query:
             self.current_query = self.current_user_query
@@ -134,6 +142,8 @@ class AgentState:
             "trace_id": self.trace_id,
             "task_type": self.task_type,
             "classification_reasoning": self.classification_reasoning,
+            "clarification_question": self.clarification_question,
+            "ambiguity_type": self.ambiguity_type,
             "requires_rag": self.requires_rag,
             "requires_sandbox": self.requires_sandbox,
             "model_id": self.model_id,
@@ -158,5 +168,7 @@ class AgentState:
             "temporal_claims": self.temporal_claims,
             "requires_human_review": self.requires_human_review,
             "approval_id": self.approval_id,
+            "vision_status": self.vision_status,
+            "vision_error": self.vision_error,
         }
 

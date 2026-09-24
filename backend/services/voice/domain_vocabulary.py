@@ -127,7 +127,7 @@ DETERMINISTIC_PHONETIC_RULES: list[tuple[re.Pattern, Any]] = [
     (re.compile(r"\b(?:c\s*c\s*r)\b", re.IGNORECASE), "CCR"),
 ]
 
-TAG_RE = re.compile(r"\b(\d{1,3})[- ]+([A-Za-z]{1,3})[- ]+(\d{1,4})[- ]*([A-Za-z])?\b")
+TAG_RE = re.compile(r"\b(\d{1,3})[- ]*([A-Za-z]{1,3})[- ]*(\d{1,4})[- ]*([A-Za-z])?\b")
 
 
 def normalize_asr_transcript(text: str) -> tuple[str, bool]:

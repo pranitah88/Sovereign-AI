@@ -62,22 +62,45 @@ def audit_log(
         details: Arbitrary dict with extra context.
         ip_address: Client IP address.
     """
-    log_id = audit_repo.write_log(
-        action=action,
-        outcome=outcome,
-        user_id=user_id,
-        username=username,
-        target=target,
-        details=details,
-        ip_address=ip_address,
-    )
+    actor = username or (f"user:{user_id}" if user_id is not None else "system")
+    target_str = target or "-"
 
-    logger.info(
-        "AUDIT | action=%s outcome=%s user=%s target=%s",
+    logger.debug(
+        "AUDIT_WRITE_STARTED | action=%s outcome=%s user=%s target=%s",
         action,
         outcome,
-        username or user_id or "system",
-        target or "-",
+        actor,
+        target_str,
     )
 
-    return log_id
+    try:
+        log_id = audit_repo.write_log(
+            action=action,
+            outcome=outcome,
+            user_id=user_id,
+            username=username,
+            target=target,
+            details=details,
+            ip_address=ip_address,
+        )
+
+        logger.info(
+            "AUDIT_WRITE_SUCCESS | log_id=%s action=%s outcome=%s user=%s target=%s",
+            log_id,
+            action,
+            outcome,
+            actor,
+            target_str,
+        )
+        return log_id
+    except Exception as exc:
+        logger.error(
+            "AUDIT_WRITE_FAILED | action=%s outcome=%s user=%s target=%s error=%s",
+            action,
+            outcome,
+            actor,
+            target_str,
+            exc,
+            exc_info=True,
+        )
+        raise

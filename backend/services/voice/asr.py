@@ -84,31 +84,9 @@ def validate_asr_quality(
     min_vocab_div = float(gate_cfg.get("min_vocab_diversity", 0.40))
     supported_langs = gate_cfg.get("supported_languages", ["en", "hi", "mr", "kn"])
 
-    # 1. Check supported language if detected by acoustic engine
-    if language:
-        clean_lang = language.lower().strip()
-        if clean_lang not in ("auto", "unknown", "detect") and clean_lang not in supported_langs:
-            return {
-                "valid": False,
-                "status": "low_confidence",
-                "low_confidence": True,
-                "reason": f"Unsupported detected language: '{clean_lang}' (supported: {supported_langs})",
-                "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
-            }
-
-    # 2. Check language probability
-    if language_prob < min_lang_prob:
-        return {
-            "valid": False,
-            "status": "low_confidence",
-            "low_confidence": True,
-            "reason": f"Language confidence too low: {language_prob:.2f} < {min_lang_prob}",
-            "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
-        }
-
     lower_text = clean_text.lower().rstrip(".,!?")
 
-    # 3. Check for abnormal / non-supported foreign characters (e.g. Turkish ı, ş, ğ, etc.)
+    # 1. Check for abnormal / non-supported foreign characters (e.g. Turkish ı, ş, ğ, Cyrillic, Chinese, etc.)
     # Indian languages use Devanagari, Kannada script, or standard Latin English
     foreign_chars = re.findall(r"[\u0131\u011f\u015f\u015e\u0130\u011e\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF]", clean_text)
     if foreign_chars:
@@ -117,6 +95,7 @@ def validate_asr_quality(
             "status": "low_confidence",
             "low_confidence": True,
             "reason": f"Abnormal/unsupported foreign characters detected: '{''.join(set(foreign_chars))}'",
+            "low_confidence_reason": "foreign_characters",
             "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
         }
 
@@ -132,10 +111,42 @@ def validate_asr_quality(
             "status": "low_confidence",
             "low_confidence": True,
             "reason": "Pathological foreign speech pattern detected",
+            "low_confidence_reason": "foreign_characters",
             "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
         }
 
-    # 4. Common Whisper noise/silence hallucination phrases
+    # 2. Check supported language & language probability without falsely rejecting valid speech:
+    # On short audio snippets (< 3s), Whisper-tiny's whole-audio language classifier frequently jitters
+    # (e.g. mislabels English as 'nn', 'cy', 'la' or returns low language_prob).
+    # If the text is composed of supported scripts (Latin, Devanagari, Kannada), downstream
+    # language detection in multilingual.py accurately classifies it.
+    is_supported_script = bool(re.search(r"[a-zA-Z0-9\u0900-\u097F\u0C80-\u0CFF]", clean_text))
+    if language:
+        clean_lang = language.lower().strip()
+        if clean_lang not in ("auto", "unknown", "detect") and clean_lang not in supported_langs:
+            if not is_supported_script or confidence < min_token_prob:
+                return {
+                    "valid": False,
+                    "status": "low_confidence",
+                    "low_confidence": True,
+                    "reason": f"Unsupported detected language: '{clean_lang}' (supported: {supported_langs})",
+                    "low_confidence_reason": "unsupported_language",
+                    "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
+                }
+
+    # If language probability is low AND acoustic token confidence is also below threshold, reject.
+    # Otherwise, if acoustic token confidence is solid, accept and let downstream multilingual handle it.
+    if language_prob < min_lang_prob and confidence < min_token_prob:
+        return {
+            "valid": False,
+            "status": "low_confidence",
+            "low_confidence": True,
+            "reason": f"Language confidence too low: {language_prob:.2f} < {min_lang_prob}",
+            "low_confidence_reason": "low_token_confidence",
+            "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
+        }
+
+    # 3. Common Whisper noise/silence hallucination phrases
     hallucination_phrases = [
         "thank you for watching",
         "thanks for watching",
@@ -151,12 +162,13 @@ def validate_asr_quality(
             "status": "repetition_hallucination",
             "low_confidence": True,
             "reason": f"Noise hallucination phrase detected: '{lower_text}'",
+            "low_confidence_reason": "noise_hallucination",
             "spoken_prompt": "Sorry, I didn't catch that. Could you say it again?",
         }
 
     words = re.findall(r"\b\w+\b", lower_text)
     if len(words) >= 3:
-        # 5. Single word consecutive repetition (>= 3 in a row, e.g. "of of of" or "bit of bit of")
+        # 4. Single word consecutive repetition (>= 3 in a row, e.g. "of of of" or "bit of bit of")
         consecutive_repeat_count = 1
         for i in range(1, len(words)):
             if words[i] == words[i - 1]:
@@ -167,12 +179,13 @@ def validate_asr_quality(
                         "status": "repetition_hallucination",
                         "low_confidence": True,
                         "reason": f"Consecutive repeated word: '{words[i]}'",
+                        "low_confidence_reason": "repetition_detected",
                         "spoken_prompt": "Sorry, I didn't catch that. Could you say it again?",
                     }
             else:
                 consecutive_repeat_count = 1
 
-        # 6. Repeated n-grams (2-word to 5-word phrases appearing >= max_ngram_reps times)
+        # 5. Repeated n-grams (2-word to 5-word phrases appearing >= max_ngram_reps times)
         from collections import Counter
         for n in range(2, min(6, len(words) // 2 + 1)):
             ngrams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
@@ -185,10 +198,11 @@ def validate_asr_quality(
                         "status": "repetition_hallucination",
                         "low_confidence": True,
                         "reason": f"Pathological n-gram repetition ({count}x): '{phrase}'",
+                        "low_confidence_reason": "repetition_detected",
                         "spoken_prompt": "Sorry, I didn't catch that. Could you say it again?",
                     }
 
-        # 7. Low vocabulary diversity for runaway transcripts (>= 6 words with unique ratio < min_vocab_div)
+        # 6. Low vocabulary diversity for runaway transcripts (>= 6 words with unique ratio < min_vocab_div)
         if len(words) >= 6:
             unique_ratio = len(set(words)) / len(words)
             if unique_ratio < min_vocab_div:
@@ -197,20 +211,22 @@ def validate_asr_quality(
                     "status": "repetition_hallucination",
                     "low_confidence": True,
                     "reason": f"Low vocabulary diversity ({unique_ratio:.2f} < {min_vocab_div})",
+                    "low_confidence_reason": "repetition_detected",
                     "spoken_prompt": "Sorry, I didn't catch that. Could you say it again?",
                 }
 
-    # 8. Check acoustic token probability
+    # 7. Check acoustic token probability
     if confidence < min_token_prob:
         return {
             "valid": False,
             "status": "low_confidence",
             "low_confidence": True,
             "reason": f"Token acoustic confidence too low: {confidence:.2f} < {min_token_prob}",
+            "low_confidence_reason": "low_token_confidence",
             "spoken_prompt": "Sorry, I didn't catch that. Could you repeat it?",
         }
 
-    return {"valid": True, "status": "success", "low_confidence": False, "reason": "Quality verified"}
+    return {"valid": True, "status": "success", "low_confidence": False, "reason": "Quality verified", "low_confidence_reason": None}
 
 
 
@@ -243,6 +259,18 @@ class BaseASREngine(ABC):
     def is_ready(self) -> tuple[bool, str]:
         """Return (is_ready, status_message)."""
         pass
+
+    def warmup(self) -> bool:
+        """Pre-warm model weights. Default no-op for generic engines."""
+        return True
+
+    def transcribe_partial(
+        self,
+        audio_data: bytes | io.BytesIO | str,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        """Fast low-latency partial transcription of live audio slices."""
+        return self.transcribe(audio_data, language=language)
 
 
 class LocalWhisperASR(BaseASREngine):
@@ -443,9 +471,11 @@ class LocalWhisperASR(BaseASREngine):
             if not quality["valid"]:
                 status = quality["status"]
                 effective_confidence = 0.0
+                low_conf_reason = quality.get("low_confidence_reason") or quality.get("reason")
             else:
                 status = "success" if overall_confidence >= self.confidence_threshold else "low_confidence"
                 effective_confidence = overall_confidence
+                low_conf_reason = f"Token acoustic confidence too low: {overall_confidence:.2f} < {self.confidence_threshold:.2f}" if status == "low_confidence" else None
 
             is_low_confidence = (status == "low_confidence") or not quality["valid"]
 
@@ -461,6 +491,7 @@ class LocalWhisperASR(BaseASREngine):
                 "confidence": effective_confidence,
                 "status": status,
                 "low_confidence": is_low_confidence,
+                "low_confidence_reason": low_conf_reason,
                 "duration_seconds": total_duration,
                 "engine": f"faster-whisper ({self.model_name})",
                 "quality": quality,
@@ -471,6 +502,9 @@ class LocalWhisperASR(BaseASREngine):
                     "raw_text": full_text,
                     "is_normalized": is_normalized,
                     "quality_reason": quality.get("reason"),
+                    "low_confidence_reason": low_conf_reason,
+                    "raw_confidence": overall_confidence,
+                    "confidence_threshold": self.confidence_threshold,
                 },
             }
 

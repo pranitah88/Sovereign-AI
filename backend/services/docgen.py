@@ -4,13 +4,16 @@ Strictly verifies file existence, size, and readability before returning success
 """
 
 from dataclasses import dataclass, field
-import html
-import logging
-import re
 from datetime import datetime, timezone
+import html
+import io
+import logging
 from pathlib import Path
-from typing import List, Tuple, Optional
+import re
+from typing import List, Tuple, Optional, Any
+import uuid
 
+from PIL import Image as PILImage
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt, RGBColor
@@ -23,6 +26,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfgen import canvas
 from reportlab.platypus import (
     HRFlowable,
+    Image as RLImage,
     KeepTogether,
     Paragraph,
     SimpleDocTemplate,
@@ -154,7 +158,14 @@ class ParsedReport:
     timestamp: str
     notice: str
     sections: list[ReportSection]
-    sources: list[str]
+    sources: list[str] = field(default_factory=list)
+    analysis_id: str = ""
+    image_hash: str = ""
+    analysis_source: str = ""
+    verification_status: str = ""
+    request_query: str = ""
+    image_bytes: bytes | None = None
+    image_path: str | None = None
 
 
 class NumberedCanvas(canvas.Canvas):
@@ -165,7 +176,7 @@ class NumberedCanvas(canvas.Canvas):
 
     def showPage(self):
         self._saved_page_states.append(dict(self.__dict__))
-        self._startPage()
+        self._startPage()  # type: ignore[attr-defined]
 
     def save(self):
         num_pages = len(self._saved_page_states)
@@ -184,7 +195,8 @@ class NumberedCanvas(canvas.Canvas):
         # Margin: left 54, right 612-54=558
         self.line(54, 36, 612 - 54, 36)
         self.drawString(54, 24, "MRPL Sovereign AI Workbench | Confidential & Proprietary")
-        page_str = f"Page {self._pageNumber} of {page_count}"
+        page_num = getattr(self, "_pageNumber", 1)
+        page_str = f"Page {page_num} of {page_count}"
         self.drawRightString(612 - 54, 24, page_str)
         self.restoreState()
 
@@ -424,6 +436,15 @@ def parse_analysis_report(
                 matched_sec = canonical_name
                 break
 
+        if not matched_sec:
+            # Detect Markdown section headers (e.g. "### 1. Visually Observed Elements" or "## Section Title")
+            if (trimmed.startswith("### ") or trimmed.startswith("## ")) and len(trimmed) < 120:
+                matched_sec = clean_plain_text(trimmed)
+            else:
+                numbered_sec = re.match(r"^(?:#+\s*|\*\*)?(\d+[\.\)]\s+[A-Za-z0-9_\-\s/&]+)(?:\*\*)?$", trimmed)
+                if numbered_sec and len(trimmed) < 120:
+                    matched_sec = clean_plain_text(trimmed)
+
         if matched_sec:
             if current_sec_title:
                 flush_lines_to_section(current_sec_title, current_lines)
@@ -457,9 +478,17 @@ def parse_analysis_report(
     ]
 
     sections: list[ReportSection] = []
+    seen_sections = set()
     for c_title in ordered_canonical:
         if c_title in sections_dict and sections_dict[c_title]:
             sections.append(ReportSection(title=c_title, elements=sections_dict[c_title]))
+            seen_sections.add(c_title)
+
+    # Include any dynamic/custom sections (e.g. Visually Observed Elements, Architecture, etc.)
+    for sec_title, elements in sections_dict.items():
+        if sec_title not in seen_sections and sec_title != "Sources" and elements:
+            sections.append(ReportSection(title=sec_title, elements=elements))
+            seen_sections.add(sec_title)
 
     # Collect Sources
     if "Sources" in sections_dict and sections_dict["Sources"]:
@@ -634,12 +663,27 @@ def render_report_to_pdf(report: ParsedReport, output_path: Path) -> Path:
 
     # 2. Metadata Table
     meta_rows = [
-        [Paragraph("Document:", meta_label_style), Paragraph(html.escape(report.document_name), meta_value_style)],
+        [Paragraph("Document / Image:", meta_label_style), Paragraph(html.escape(report.document_name), meta_value_style)],
+    ]
+    if report.analysis_id:
+        meta_rows.append([Paragraph("Analysis ID:", meta_label_style), Paragraph(html.escape(report.analysis_id), meta_value_style)])
+    if report.image_hash:
+        disp_hash = report.image_hash[:16] + "..." + report.image_hash[-8:] if len(report.image_hash) > 24 else report.image_hash
+        meta_rows.append([Paragraph("Image Hash (SHA-256):", meta_label_style), Paragraph(f'<font face="Courier">{html.escape(disp_hash)}</font>', meta_value_style)])
+    if report.request_query:
+        meta_rows.append([Paragraph("User Request:", meta_label_style), Paragraph(html.escape(report.request_query[:160]), meta_value_style)])
+    if report.analysis_source:
+        meta_rows.append([Paragraph("Analysis Source:", meta_label_style), Paragraph(html.escape(report.analysis_source.upper()), meta_value_style)])
+    if report.verification_status:
+        meta_rows.append([Paragraph("Verification Status:", meta_label_style), Paragraph(html.escape(report.verification_status), meta_value_style)])
+
+    meta_rows.extend([
         [Paragraph("Generated by:", meta_label_style), Paragraph(html.escape(report.organization), meta_value_style)],
         [Paragraph("Environment:", meta_label_style), Paragraph(html.escape(report.environment), meta_value_style)],
         [Paragraph("Timestamp:", meta_label_style), Paragraph(html.escape(report.timestamp), meta_value_style)],
-    ]
-    meta_table = Table(meta_rows, colWidths=[100, 404])
+    ])
+
+    meta_table = Table(meta_rows, colWidths=[120, 384])
     meta_table.setStyle(
         TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -669,9 +713,54 @@ def render_report_to_pdf(report: ParsedReport, output_path: Path) -> Path:
     story.append(notice_table)
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E0"), spaceBefore=10, spaceAfter=8))
 
-    # 4. Canonical Sections
+    # 4. Embedded Visual Input (if image provided)
+    if report.image_bytes or report.image_path:
+        try:
+            raw_img = report.image_bytes
+            if not raw_img and report.image_path and Path(report.image_path).exists():
+                with open(report.image_path, "rb") as f_img:
+                    raw_img = f_img.read()
+            if raw_img:
+                with PILImage.open(io.BytesIO(raw_img)) as pil_img:
+                    w_px, h_px = pil_img.size
+                max_w = 460.0
+                max_h = 240.0
+                aspect = w_px / float(h_px) if h_px > 0 else 1.0
+                if w_px > max_w:
+                    target_w = max_w
+                    target_h = max_w / aspect
+                else:
+                    target_w = float(w_px)
+                    target_h = float(h_px)
+                if target_h > max_h:
+                    target_h = max_h
+                    target_w = max_h * aspect
+
+                story.append(Paragraph("<b>Input Diagram / Schematic Evidence</b>", subheading_style))
+                story.append(Spacer(1, 4))
+                story.append(RLImage(io.BytesIO(raw_img), width=target_w, height=target_h))
+                caption_text = f"<i>Figure 1: Analyzed Visual Input — {html.escape(report.document_name)}</i>"
+                if report.image_hash:
+                    caption_text += f" &nbsp;[SHA-256: <code>{html.escape(report.image_hash[:16])}...</code>]"
+                caption_style = ParagraphStyle(
+                    "ImageCaption",
+                    parent=styles["Normal"],
+                    fontName="Helvetica",
+                    fontSize=8,
+                    textColor=colors.HexColor("#64748B"),
+                    alignment=1,
+                    spaceBefore=4,
+                    spaceAfter=8,
+                )
+                story.append(Paragraph(caption_text, caption_style))
+                story.append(Spacer(1, 4))
+        except Exception as img_err:
+            logger.warning("Could not embed image into PDF: %s", img_err)
+            story.append(Paragraph(f"<i>[Warning: Uploaded image could not be embedded into PDF report: {html.escape(str(img_err))}]</i>", body_style))
+
+    # 5. Canonical and Dynamic Sections
     for sec in report.sections:
-        sec_flowables = [Paragraph(html.escape(sec.title), section_heading_style)]
+        sec_flowables: list[Any] = [Paragraph(html.escape(sec.title), section_heading_style)]
         for elem in sec.elements:
             if elem.kind == "bullet":
                 sec_flowables.append(Paragraph(f"&bull;&nbsp;&nbsp;{elem.html_text}", bullet_style))
@@ -787,15 +876,41 @@ def generate_pdf(
     document_name: str | None = None,
     filename: str | None = None,
     metadata: dict | None = None,
+    image_bytes: bytes | None = None,
+    image_path: str | None = None,
+    report_data: dict | None = None,
 ) -> dict:
     """
     Generate a professional technical PDF report using ReportLab.
     Strictly parses existing analysis without duplicating sections, eliminates raw Markdown,
+    embeds image evidence if available, attaches analysis metadata,
     and verifies physical file existence and readability before returning success.
     """
     _ensure_output_dir()
 
-    doc_label = document_name or (metadata.get("document_name") if metadata else None) or "Document"
+    meta = dict(metadata or {})
+    if report_data:
+        if "title" in report_data and (not title or title == "DOCUMENT ANALYSIS REPORT"):
+            title = report_data["title"]
+        if "filename" in report_data and not document_name:
+            document_name = report_data["filename"]
+        if "document_name" in report_data and not document_name:
+            document_name = report_data["document_name"]
+        for k in ("analysis_id", "image_hash", "source", "verification_status", "request", "request_text"):
+            if k in report_data and k not in meta:
+                meta[k] = report_data[k]
+        if not content and "sections" in report_data:
+            sec_blocks = []
+            if "summary" in report_data and report_data["summary"]:
+                sec_blocks.append(f"### 1. Executive Summary\n{report_data['summary']}")
+            for sec in report_data["sections"]:
+                if isinstance(sec, dict):
+                    stitle = sec.get("title", "Section")
+                    sbody = sec.get("content", sec.get("body", ""))
+                    sec_blocks.append(f"### {stitle}\n{sbody}")
+            content = "\n\n".join(sec_blocks)
+
+    doc_label = document_name or (meta.get("document_name") if meta else None) or "Document"
     if not filename:
         clean_doc = _safe_filename(doc_label, ext="")
         fname = f"{clean_doc}_Analysis.pdf"
@@ -805,8 +920,17 @@ def generate_pdf(
     output_path = _resolve_output_path(fname)
 
     # 1. Parse content into canonical report structure
-    ts = (metadata.get("timestamp") if metadata else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = (meta.get("timestamp") if meta else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     report = parse_analysis_report(content=content, document_name=doc_label, title=title, timestamp=ts)
+
+    # Attach dynamic metadata & image evidence
+    report.analysis_id = str(meta.get("analysis_id", ""))
+    report.image_hash = str(meta.get("image_hash", ""))
+    report.analysis_source = str(meta.get("source", ""))
+    report.verification_status = str(meta.get("verification_status", ""))
+    report.request_query = str(meta.get("request") or meta.get("request_text", ""))
+    report.image_bytes = image_bytes
+    report.image_path = image_path
 
     # 2. Render to PDF
     try:
@@ -910,16 +1034,16 @@ def generate_xlsx(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = title[:31]
+    if ws is not None:
+        ws.title = title[:31]
+        ws.append(["AI-GENERATED — REQUIRES HUMAN REVIEW"])
+        ws.append([])
 
-    ws.append(["AI-GENERATED — REQUIRES HUMAN REVIEW"])
-    ws.append([])
+        if headers:
+            ws.append(headers)
 
-    if headers:
-        ws.append(headers)
-
-    for row in data:
-        ws.append(row)
+        for row in data:
+            ws.append(row)
 
     wb.save(str(output_path))
 
@@ -951,21 +1075,23 @@ def generate_pptx(
 
     title_layout = prs.slide_layouts[0]
     slide = prs.slides.add_slide(title_layout)
-    slide.shapes.title.text = title
+    if slide.shapes.title is not None:
+        slide.shapes.title.text = title
     if len(slide.placeholders) > 1:
-        slide.placeholders[1].text = "AI-GENERATED — REQUIRES HUMAN REVIEW"
+        setattr(slide.placeholders[1], "text", "AI-GENERATED — REQUIRES HUMAN REVIEW")
 
     content_layout = prs.slide_layouts[1]
     for slide_data in slides:
         s = prs.slides.add_slide(content_layout)
-        s.shapes.title.text = slide_data.get("title", "")
+        if s.shapes.title is not None:
+            s.shapes.title.text = slide_data.get("title", "")
         if len(s.placeholders) > 1:
             # Check for bullet_points list or content text
             bullet_points = slide_data.get("bullet_points")
             if bullet_points and isinstance(bullet_points, list):
-                s.placeholders[1].text = "\n".join(f"• {bp}" for bp in bullet_points)
+                setattr(s.placeholders[1], "text", "\n".join(f"• {bp}" for bp in bullet_points))
             else:
-                s.placeholders[1].text = slide_data.get("content", "")
+                setattr(s.placeholders[1], "text", slide_data.get("content", ""))
 
     prs.save(str(output_path))
 

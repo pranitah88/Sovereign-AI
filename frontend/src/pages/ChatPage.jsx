@@ -32,6 +32,11 @@ export default function ChatPage({ user }) {
   const [rawTranscript, setRawTranscript] = useState('');
   const [normalizedTranscript, setNormalizedTranscript] = useState('');
   const [isNormalized, setIsNormalized] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(null); // 'NOVA' | 'DICTATION' | null
+  const voiceModeRef = useRef(null);
+  const voiceSessionIdRef = useRef(null);
+
+  const isDictating = voiceMode === 'DICTATION' || voiceMode === 'VOICE_TO_TEXT';
 
   const clarificationContextRef = useRef(null);
 
@@ -54,10 +59,41 @@ export default function ChatPage({ user }) {
   const voiceStateRef = useRef('IDLE');
   const sessionListenStartTimeRef = useRef(0);
   const [vadSilenceThresholdMs, setVadSilenceThresholdMs] = useState(750);
+  const highpassFilterRef = useRef(null);
+  const preprocessedStreamRef = useRef(null);
+  const noiseFloorRmsRef = useRef(0.008);
+  const speechRmsRef = useRef(0.0);
+  const currentRmsRef = useRef(0.0);
+  const snrDbRef = useRef(0.0);
+  const micDiagnosticsRef = useRef({});
+  const vadDiagnosticsRef = useRef({});
+  const lastDiagUpdateRef = useRef(0);
+
+  const [vadDiagnostics, setVadDiagnostics] = useState({
+    noise_floor_rms: 0.008,
+    speech_rms: 0.0,
+    current_rms: 0.0,
+    snr_db: 0.0,
+    vad_confidence: 0.0,
+    speech_active: false,
+  });
+  const [micDiagnostics, setMicDiagnostics] = useState({
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    sampleRate: 16000,
+    channelCount: 1,
+    highpassCutoffHz: 80,
+    lowpassCutoffHz: 7500,
+  });
 
   useEffect(() => {
     voiceStateRef.current = voiceState;
   }, [voiceState]);
+
+  useEffect(() => {
+    voiceModeRef.current = voiceMode;
+  }, [voiceMode]);
 
   const handleCopy = async (text, id) => {
     if (!text) return;
@@ -199,6 +235,12 @@ export default function ChatPage({ user }) {
       try { interimAbortRef.current.abort(); } catch (e) {}
       interimAbortRef.current = null;
     }
+    if (preprocessedStreamRef.current && preprocessedStreamRef.current !== mediaStreamRef.current) {
+      try {
+        preprocessedStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      preprocessedStreamRef.current = null;
+    }
     if (mediaStreamRef.current) {
       try {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
@@ -215,6 +257,7 @@ export default function ChatPage({ user }) {
       }
       audioContextRef.current = null;
     }
+    highpassFilterRef.current = null;
   };
 
   const handleInterrupt = () => {
@@ -242,19 +285,37 @@ export default function ChatPage({ user }) {
       abortControllerRef.current = null;
     }
 
-    if (activeSession?.id) {
-      voice.interrupt(activeSession.id).catch(() => {});
+    if (activeSession?.id || voiceSessionIdRef.current) {
+      voice.interrupt(activeSession?.id, voiceSessionIdRef.current).catch(() => {});
     }
 
-    setVoiceState('LISTENING');
-    // Immediately switch to listening for user's next speech / correction
-    setTimeout(() => {
-      startListening(true);
-    }, 40);
+    if (voiceModeRef.current === 'NOVA' && voiceSessionIdRef.current) {
+      setVoiceState('LISTENING');
+      setTimeout(() => {
+        startListening(true);
+      }, 40);
+    }
   };
 
-  const closeVoiceModal = () => {
-    setVoiceModalOpen(false);
+  const stopNovaAssistant = () => {
+    console.log('Nova Voice Agent: Stop Assistant invoked. Shutting down Nova session completely.');
+    const activeVoiceSessionId = voiceSessionIdRef.current;
+    voiceSessionIdRef.current = null;
+    activeTurnIdRef.current++;
+
+    // Invalidate server-side Nova session & active SSE stream
+    if (activeVoiceSessionId || activeSession?.id) {
+      voice.stop(activeVoiceSessionId, activeSession?.id).catch(() => {});
+    }
+
+    if (abortControllerRef.current) {
+      try { abortControllerRef.current.abort(); } catch (e) {}
+      abortControllerRef.current = null;
+    }
+    if (interimAbortRef.current) {
+      try { interimAbortRef.current.abort(); } catch (e) {}
+      interimAbortRef.current = null;
+    }
     if (vadIntervalRef.current) {
       clearInterval(vadIntervalRef.current);
       vadIntervalRef.current = null;
@@ -263,28 +324,144 @@ export default function ChatPage({ user }) {
       clearInterval(partialTranscribeIntervalRef.current);
       partialTranscribeIntervalRef.current = null;
     }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try { mediaRecorderRef.current.stop(); } catch (e) {}
+    if (mediaRecorderRef.current) {
+      try {
+        mediaRecorderRef.current.ondataavailable = null;
+        mediaRecorderRef.current.onstop = null;
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (e) {}
+      mediaRecorderRef.current = null;
     }
     if (activeAudioRef.current) {
-      try { activeAudioRef.current.pause(); } catch (e) {}
+      try {
+        activeAudioRef.current.pause();
+        activeAudioRef.current.currentTime = 0;
+      } catch (e) {}
       activeAudioRef.current = null;
     }
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
     setActiveAudioPlayingMsgId(null);
-    if (abortControllerRef.current) {
-      try { abortControllerRef.current.abort(); } catch (e) {}
-      abortControllerRef.current = null;
-    }
+    setActiveSpokenText('');
+
+    cleanupAudioContextAndTracks();
+
     clarificationContextRef.current = null;
     setActiveClarificationPrompt(null);
-    cleanupAudioContextAndTracks();
+    setVoiceModalOpen(false);
+    setVoiceMode(null);
+    voiceModeRef.current = null;
     setVoiceState('IDLE');
+    setVoiceStatusMsg('NOVA STOPPED');
+    setTimeout(() => {
+      setVoiceStatusMsg((prev) => (prev === 'NOVA STOPPED' ? '' : prev));
+    }, 2500);
   };
 
-  const startVoiceSession = async () => {
-    // 1. Ensure modal is open and session is in STARTING state
+  const closeVoiceModal = stopNovaAssistant;
+
+  const acquireMicrophoneStream = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Microphone API not supported on this browser.');
+    }
+    const supported = (navigator.mediaDevices.getSupportedConstraints && navigator.mediaDevices.getSupportedConstraints()) || {};
+    const audioConstraints = {};
+    if (supported.echoCancellation !== false) audioConstraints.echoCancellation = true;
+    if (supported.noiseSuppression !== false) audioConstraints.noiseSuppression = true;
+    if (supported.autoGainControl !== false) audioConstraints.autoGainControl = true;
+    if (supported.channelCount !== false) audioConstraints.channelCount = 1;
+    if (supported.sampleRate !== false) audioConstraints.sampleRate = 16000;
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+    } catch (constraintErr) {
+      console.warn('Preferred audio constraints not accepted, falling back to basic audio:', constraintErr);
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+
+    try {
+      const track = stream.getAudioTracks()[0];
+      const trackSettings = track?.getSettings ? track.getSettings() : {};
+      const trackConstraints = track?.getConstraints ? track.getConstraints() : {};
+      const diag = {
+        echoCancellation: trackSettings.echoCancellation ?? trackConstraints.echoCancellation ?? true,
+        noiseSuppression: trackSettings.noiseSuppression ?? trackConstraints.noiseSuppression ?? true,
+        autoGainControl: trackSettings.autoGainControl ?? trackConstraints.autoGainControl ?? true,
+        sampleRate: trackSettings.sampleRate || 16000,
+        channelCount: trackSettings.channelCount || 1,
+        highpassCutoffHz: 80,
+        lowpassCutoffHz: 7500,
+      };
+      micDiagnosticsRef.current = diag;
+      setMicDiagnostics(diag);
+    } catch (diagErr) {
+      console.warn('Could not extract track diagnostics:', diagErr);
+    }
+    return stream;
+  };
+
+  const setupAudioPreprocessing = async (stream) => {
+    try {
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioCtx();
+        audioContextRef.current = audioCtx;
+
+        const source = audioCtx.createMediaStreamSource(stream);
+
+        // Web Audio high-pass filter: strips fan/AC rumble < 80 Hz without affecting vocal formants
+        const highpass = audioCtx.createBiquadFilter();
+        highpass.type = 'highpass';
+        highpass.frequency.setValueAtTime(80, audioCtx.currentTime);
+        highpass.Q.setValueAtTime(0.707, audioCtx.currentTime);
+        highpassFilterRef.current = highpass;
+
+        // Web Audio low-pass filter: cuts high-frequency electrical hiss and fan whine > 7500 Hz
+        const lowpass = audioCtx.createBiquadFilter();
+        lowpass.type = 'lowpass';
+        lowpass.frequency.setValueAtTime(7500, audioCtx.currentTime);
+        lowpass.Q.setValueAtTime(0.707, audioCtx.currentTime);
+
+        source.connect(highpass);
+        highpass.connect(lowpass);
+
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        lowpass.connect(analyser);
+        analyserRef.current = analyser;
+
+        preprocessedStreamRef.current = stream;
+      }
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
+    } catch (e) {
+      console.warn('AudioContext setup warning:', e);
+      preprocessedStreamRef.current = stream;
+    }
+  };
+
+  const startNovaAssistant = async () => {
+    // If voice-to-text / dictation is running, cancel it cleanly
+    if (voiceModeRef.current === 'VOICE_TO_TEXT' || voiceModeRef.current === 'DICTATION') {
+      cancelVoiceToText();
+    }
+
+    // 1. Create a brand-new unique session ID for Nova
+    const newSessionId = `nov_ses_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    voiceSessionIdRef.current = newSessionId;
+    activeTurnIdRef.current = 1;
+    setVoiceMode('NOVA');
+    voiceModeRef.current = 'NOVA';
+
+    // Register active session with backend
+    if (voice.registerSession) {
+      voice.registerSession(newSessionId).catch(() => {});
+    }
+
     setVoiceModalOpen(true);
     setVoiceState('STARTING');
     setVoiceStatusMsg('');
@@ -294,13 +471,14 @@ export default function ChatPage({ user }) {
     setActiveTrace([
       {
         event: 'VOICE_SESSION_STARTED',
-        title: 'Voice session started',
+        title: 'Nova Voice Assistant session started',
         status: 'allowed',
         timestamp: new Date().toISOString(),
+        details: { voice_session_id: newSessionId, voice_mode: 'NOVA' },
       },
       {
-        event: 'GREETING_STARTED',
-        title: 'Playing natural local greeting',
+        event: 'VOICE_GREETING_STARTED',
+        title: 'Playing deterministic Nova greeting',
         status: 'allowed',
         timestamp: new Date().toISOString(),
       },
@@ -310,18 +488,9 @@ export default function ChatPage({ user }) {
     try {
       if (!mediaStreamRef.current || !mediaStreamRef.current.active) {
         if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const stream = await acquireMicrophoneStream();
           mediaStreamRef.current = stream;
-          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-            const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            const audioCtx = new AudioCtx();
-            audioContextRef.current = audioCtx;
-            const source = audioCtx.createMediaStreamSource(stream);
-            const analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 512;
-            source.connect(analyser);
-            analyserRef.current = analyser;
-          }
+          await setupAudioPreprocessing(stream);
         }
       }
     } catch (micErr) {
@@ -331,7 +500,7 @@ export default function ChatPage({ user }) {
     try {
       setVoiceState('GREETING');
       const greetingData = await voice.greeting(voiceLanguage);
-      const greetingText = greetingData?.text || 'Hi! What can I help you with?';
+      const greetingText = greetingData?.text || "Hi, I'm Nova. How can I help you today?";
       setActiveSpokenText(greetingText);
 
       if (greetingData?.audio_base64) {
@@ -340,17 +509,19 @@ export default function ChatPage({ user }) {
 
         audio.onended = () => {
           activeAudioRef.current = null;
+          // Guard: if user stopped Nova while greeting was playing, do not start listening
+          if (voiceSessionIdRef.current !== newSessionId || voiceModeRef.current !== 'NOVA') return;
           setActiveTrace((prev) => [
             ...prev,
             {
               event: 'GREETING_COMPLETED',
-              title: 'Greeting finished speaking',
+              title: 'Nova greeting finished speaking',
               status: 'verified',
               timestamp: new Date().toISOString(),
             },
             {
-              event: 'LISTENING_RESUMED',
-              title: 'Hands-free continuous listening resumed',
+              event: 'LISTENING',
+              title: 'Hands-free continuous listening active',
               status: 'allowed',
               timestamp: new Date().toISOString(),
             },
@@ -361,29 +532,39 @@ export default function ChatPage({ user }) {
 
         audio.onerror = () => {
           activeAudioRef.current = null;
+          if (voiceSessionIdRef.current !== newSessionId || voiceModeRef.current !== 'NOVA') return;
           setVoiceState('LISTENING');
           startListening(true);
         };
 
         audio.play().catch(() => {
           activeAudioRef.current = null;
+          if (voiceSessionIdRef.current !== newSessionId || voiceModeRef.current !== 'NOVA') return;
           setVoiceState('LISTENING');
           startListening(true);
         });
       } else {
         setTimeout(() => {
+          if (voiceSessionIdRef.current !== newSessionId || voiceModeRef.current !== 'NOVA') return;
           setVoiceState('LISTENING');
           startListening(true);
         }, 800);
       }
     } catch (greetErr) {
       console.warn('Greeting fetch notice:', greetErr);
+      if (voiceSessionIdRef.current !== newSessionId || voiceModeRef.current !== 'NOVA') return;
       setVoiceState('LISTENING');
       startListening(true);
     }
   };
 
+  const startVoiceSession = startNovaAssistant;
+
   const startListening = async (isAutoResume = false) => {
+    // Safety guard: only listen when Nova is actively running
+    if (voiceModeRef.current !== 'NOVA' || !voiceSessionIdRef.current) {
+      return;
+    }
     // If speaking or greeting, user speaking is an interruption
     if (!isAutoResume && (voiceState === 'GREETING' || voiceState === 'SPEAKING' || voiceState === 'SPEAKING_CLARIFICATION' || voiceState === 'ASKING_CLARIFICATION' || voiceState === 'CLARIFYING')) {
       handleInterrupt();
@@ -399,14 +580,10 @@ export default function ChatPage({ user }) {
     try {
       let stream = mediaStreamRef.current;
       if (!stream || !stream.active) {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          setVoiceState('ERROR');
-          setVoiceStatusMsg('Microphone API not supported on this browser.');
-          return;
-        }
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await acquireMicrophoneStream();
         mediaStreamRef.current = stream;
       }
+      await setupAudioPreprocessing(stream);
 
       audioChunksRef.current = [];
       speechDetectedRef.current = false;
@@ -414,22 +591,12 @@ export default function ChatPage({ user }) {
 
       // Setup or resume Web Audio VAD with acoustic barge-in monitoring
       try {
-        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-          const AudioCtx = window.AudioContext || window.webkitAudioContext;
-          const audioCtx = new AudioCtx();
-          audioContextRef.current = audioCtx;
-          const source = audioCtx.createMediaStreamSource(stream);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 512;
-          source.connect(analyser);
-          analyserRef.current = analyser;
-        } else if (audioContextRef.current.state === 'suspended') {
-          await audioContextRef.current.resume();
-        }
-
         const analyser = analyserRef.current;
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        const energyThreshold = 0.022;
+        let noiseFloorRms = noiseFloorRmsRef.current || 0.008;
+        const minEnergyFloor = 0.012;
+        const snrStartDb = 6.0;
+        const snrStopDb = 3.0;
         const silenceThresholdMs = vadSilenceThresholdMs || 750;
 
         if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
@@ -443,38 +610,73 @@ export default function ChatPage({ user }) {
             sumSquares += normalized * normalized;
           }
           const rms = Math.sqrt(sumSquares / dataArray.length);
+          currentRmsRef.current = rms;
 
           const currentState = voiceStateRef.current;
 
           // 1. Acoustic Barge-In detection while assistant is speaking or greeting
           if (currentState === 'GREETING' || currentState === 'SPEAKING' || currentState === 'SPEAKING_CLARIFICATION' || currentState === 'ASKING_CLARIFICATION') {
-            const bargeInThreshold = 0.038;
+            const bargeInThreshold = Math.max(0.035, noiseFloorRms * 2.5);
             if (rms >= bargeInThreshold) {
-              console.log('Voice Agent: Acoustic barge-in detected during playback (RMS:', rms, ')');
+              console.log('Voice Agent: Acoustic barge-in detected during playback (RMS:', rms, ', noise floor:', noiseFloorRms, ')');
               handleInterrupt();
               return;
             }
           }
 
-          // 2. Turn-taking detection during listening
+          // 2. Adaptive Turn-taking detection during listening
           if (currentState === 'LISTENING' || currentState === 'WAITING_FOR_USER_REPLY' || currentState === 'USER_SPEAKING') {
-            if (rms >= energyThreshold) {
+            const snrDb = 20 * Math.log10(Math.max(rms, 1e-5) / Math.max(noiseFloorRms, 1e-5));
+            snrDbRef.current = snrDb;
+
+            // Dual-threshold hysteresis: start vs stop
+            let isSpeechActive = false;
+            if (speechDetectedRef.current) {
+              isSpeechActive = (snrDb >= snrStopDb && rms >= minEnergyFloor * 0.8) || (rms >= noiseFloorRms * 1.3 && rms >= minEnergyFloor);
+            } else {
+              isSpeechActive = (rms >= minEnergyFloor) && (snrDb >= snrStartDb || rms >= noiseFloorRms * 2.0);
+            }
+
+            if (isSpeechActive) {
               speechDetectedRef.current = true;
               lastSpeechTimeRef.current = Date.now();
+              speechRmsRef.current = 0.9 * (speechRmsRef.current || rms) + 0.1 * rms;
               if (currentState !== 'USER_SPEAKING') {
                 setVoiceState('USER_SPEAKING');
               }
-            } else if (speechDetectedRef.current && (Date.now() - lastSpeechTimeRef.current) >= silenceThresholdMs) {
-              // End of speech detected automatically via silence threshold -> finalize immediately
-              console.log('Voice Agent: Endpoint silence detected -> finalizing utterance');
-              stopListening();
-            } else if (!speechDetectedRef.current && sessionListenStartTimeRef.current > 0 && (Date.now() - sessionListenStartTimeRef.current) >= 20000) {
-              // Hands-free conversational timeout: 20 seconds of silence with zero speech -> return to IDLE
-              console.log('Voice Agent: Conversational silence timeout reached.');
-              closeVoiceModal();
+            } else {
+              // Smooth ambient noise floor during non-speech periods
+              noiseFloorRms = 0.96 * noiseFloorRms + 0.04 * rms;
+              noiseFloorRms = Math.max(Math.min(noiseFloorRms, 0.2), 1e-5);
+              noiseFloorRmsRef.current = noiseFloorRms;
+
+              if (speechDetectedRef.current && (Date.now() - lastSpeechTimeRef.current) >= silenceThresholdMs) {
+                console.log('Voice Agent: Adaptive endpoint silence detected (SNR:', snrDb.toFixed(1), 'dB, noise floor:', noiseFloorRms.toFixed(4), ') -> finalizing utterance');
+                stopListening();
+              } else if (!speechDetectedRef.current && sessionListenStartTimeRef.current > 0 && (Date.now() - sessionListenStartTimeRef.current) >= 20000) {
+                console.log('Voice Agent: Conversational silence timeout reached.');
+                stopNovaAssistant();
+              }
+            }
+
+            const vadConfidence = isSpeechActive ? Math.min(Math.max((snrDb - snrStopDb) / 12.0, 0.1), 1.0) : 0.0;
+            const diagObj = {
+              noise_floor_rms: Number(noiseFloorRms.toFixed(4)),
+              speech_rms: Number((speechRmsRef.current || 0).toFixed(4)),
+              current_rms: Number(rms.toFixed(4)),
+              snr_db: Number(snrDb.toFixed(2)),
+              vad_confidence: Number(vadConfidence.toFixed(2)),
+              speech_active: Boolean(isSpeechActive),
+            };
+            vadDiagnosticsRef.current = diagObj;
+
+            const now = Date.now();
+            if (now - lastDiagUpdateRef.current >= 120) {
+              lastDiagUpdateRef.current = now;
+              setVadDiagnostics(diagObj);
             }
           }
-        }, 40);
+        }, 35);
       } catch (vadErr) {
         console.warn('Web Audio VAD setup note:', vadErr);
       }
@@ -548,7 +750,22 @@ export default function ChatPage({ user }) {
       speechDetectedRef.current = false;
       lastSpeechTimeRef.current = Date.now();
 
-      const mediaRecorder = new MediaRecorder(stream);
+      let mimeType = 'audio/webm;codecs=opus';
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'audio/webm';
+          if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = 'audio/ogg;codecs=opus';
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+              mimeType = '';
+            }
+          }
+        }
+      }
+
+      const recordStream = preprocessedStreamRef.current || stream;
+      const recorderOptions = mimeType ? { mimeType } : undefined;
+      const mediaRecorder = new MediaRecorder(recordStream, recorderOptions);
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event) => {
@@ -558,7 +775,6 @@ export default function ChatPage({ user }) {
       };
 
       mediaRecorder.onstop = async () => {
-        // DO NOT kill stream or audio context here — keep alive for continuous conversation and barge-in!
         if (partialTranscribeIntervalRef.current) {
           clearInterval(partialTranscribeIntervalRef.current);
           partialTranscribeIntervalRef.current = null;
@@ -568,7 +784,12 @@ export default function ChatPage({ user }) {
           interimAbortRef.current = null;
         }
 
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        // If Nova was stopped while recording, do not process and do not restart listening
+        if (voiceModeRef.current !== 'NOVA' || !voiceSessionIdRef.current) {
+          return;
+        }
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
         if (audioBlob.size > 1000) {
           await handleProcessVoiceStream(audioBlob);
         } else {
@@ -606,14 +827,259 @@ export default function ChatPage({ user }) {
     }
   };
 
-  const toggleListening = () => {
-    if (voiceState === 'GREETING' || voiceState === 'SPEAKING' || voiceState === 'SPEAKING_CLARIFICATION' || voiceState === 'ASKING_CLARIFICATION' || voiceState === 'CLARIFYING') {
-      // Barge-in: interrupt assistant immediately
-      handleInterrupt();
-    } else if (voiceState === 'LISTENING' || voiceState === 'WAITING_FOR_USER_REPLY' || voiceState === 'USER_SPEAKING') {
-      stopListening();
-    } else if (voiceState === 'IDLE' || voiceState === 'ERROR') {
-      startVoiceSession();
+  // ── Normal Voice Input (Dictation) Mode Handlers ───────────────────────
+  const startVoiceToText = async () => {
+    // If Nova is running, stop it completely
+    if (voiceModeRef.current === 'NOVA' || voiceModalOpen) {
+      stopNovaAssistant();
+    }
+
+    setVoiceMode('DICTATION');
+    voiceModeRef.current = 'DICTATION';
+    setVoiceModalOpen(false); // Does NOT open modal
+    setVoiceState('VOICE_TO_TEXT_LISTENING');
+    setVoiceStatusMsg('');
+    setPartialTranscript('');
+
+    try {
+      let stream = mediaStreamRef.current;
+      if (!stream || !stream.active) {
+        stream = await acquireMicrophoneStream();
+        mediaStreamRef.current = stream;
+      }
+      await setupAudioPreprocessing(stream);
+
+      audioChunksRef.current = [];
+      speechDetectedRef.current = false;
+      lastSpeechTimeRef.current = Date.now();
+      let firstSpeechTime = 0;
+      let consecutiveSpeechFrames = 0;
+
+      // VAD silence detection for Voice-to-Text
+      const analyser = analyserRef.current;
+      const dataArray = new Uint8Array(analyser ? analyser.frequencyBinCount : 256);
+      let noiseFloorRms = noiseFloorRmsRef.current || 0.008;
+      const minEnergyFloor = 0.012;
+      const snrStartDb = 6.0;
+      const snrStopDb = 3.0;
+      const silenceThresholdMs = 1500;
+
+      if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = setInterval(() => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const normalized = (dataArray[i] - 128) / 128;
+          sumSquares += normalized * normalized;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        currentRmsRef.current = rms;
+
+        const snrDb = 20 * Math.log10(Math.max(rms, 1e-5) / Math.max(noiseFloorRms, 1e-5));
+        let isSpeechActive = false;
+        if (speechDetectedRef.current) {
+          isSpeechActive = (snrDb >= snrStopDb && rms >= minEnergyFloor * 0.8) || (rms >= noiseFloorRms * 1.3 && rms >= minEnergyFloor);
+        } else {
+          isSpeechActive = (rms >= minEnergyFloor) && (snrDb >= snrStartDb || rms >= noiseFloorRms * 2.0);
+        }
+
+        if (isSpeechActive) {
+          consecutiveSpeechFrames++;
+          if (consecutiveSpeechFrames >= 4) {
+            if (!speechDetectedRef.current) {
+              speechDetectedRef.current = true;
+              firstSpeechTime = Date.now();
+            }
+            lastSpeechTimeRef.current = Date.now();
+          }
+        } else {
+          consecutiveSpeechFrames = 0;
+          noiseFloorRms = 0.96 * noiseFloorRms + 0.04 * rms;
+          noiseFloorRmsRef.current = noiseFloorRms;
+          const speechDuration = firstSpeechTime > 0 ? (Date.now() - firstSpeechTime) : 0;
+          if (speechDetectedRef.current && speechDuration >= 400 && (Date.now() - lastSpeechTimeRef.current) >= silenceThresholdMs) {
+            stopVoiceToText();
+          }
+        }
+      }, 40);
+
+      // Interim partial transcription
+      if (partialTranscribeIntervalRef.current) clearInterval(partialTranscribeIntervalRef.current);
+      partialTranscribeIntervalRef.current = setInterval(async () => {
+        if (!speechDetectedRef.current || audioChunksRef.current.length === 0) return;
+        try {
+          if (interimAbortRef.current) {
+            try { interimAbortRef.current.abort(); } catch (e) {}
+          }
+          const abortCtrl = new AbortController();
+          interimAbortRef.current = abortCtrl;
+          const sliceBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          if (sliceBlob.size > 2000) {
+            const interim = await voice.partialTranscribe(sliceBlob, voiceLanguage, abortCtrl.signal);
+            if (interim && interim.text && interim.text.trim()) {
+              setPartialTranscript(interim.text.trim());
+            }
+          }
+        } catch (e) {}
+      }, 1000);
+
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.ondataavailable = null;
+        mediaRecorderRef.current.onstop = null;
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          try { mediaRecorderRef.current.stop(); } catch (e) {}
+        }
+        mediaRecorderRef.current = null;
+      }
+
+      let mimeType = 'audio/webm;codecs=opus';
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+        if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/webm';
+      }
+
+      const recorder = new MediaRecorder(preprocessedStreamRef.current || stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        if (partialTranscribeIntervalRef.current) {
+          clearInterval(partialTranscribeIntervalRef.current);
+          partialTranscribeIntervalRef.current = null;
+        }
+        if (vadIntervalRef.current) {
+          clearInterval(vadIntervalRef.current);
+          vadIntervalRef.current = null;
+        }
+        const blob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
+        if (blob.size > 1000) {
+          await handleProcessVoiceToText(blob);
+        } else {
+          setVoiceState('IDLE');
+          setVoiceMode(null);
+          voiceModeRef.current = null;
+          cleanupAudioContextAndTracks();
+        }
+      };
+
+      recorder.start(250);
+    } catch (err) {
+      console.error('Voice-to-Text mic access error:', err);
+      cleanupAudioContextAndTracks();
+      setVoiceState('ERROR');
+      setVoiceStatusMsg(err.name === 'NotAllowedError' ? 'Microphone permission denied.' : 'Microphone unavailable.');
+      setVoiceMode(null);
+      voiceModeRef.current = null;
+    }
+  };
+
+  const stopVoiceToText = () => {
+    if (partialTranscribeIntervalRef.current) {
+      clearInterval(partialTranscribeIntervalRef.current);
+      partialTranscribeIntervalRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      setVoiceState('TRANSCRIBING');
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const cancelVoiceToText = () => {
+    if (partialTranscribeIntervalRef.current) {
+      clearInterval(partialTranscribeIntervalRef.current);
+      partialTranscribeIntervalRef.current = null;
+    }
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.ondataavailable = null;
+      mediaRecorderRef.current.onstop = null;
+      if (mediaRecorderRef.current.state !== 'inactive') {
+        try { mediaRecorderRef.current.stop(); } catch (e) {}
+      }
+      mediaRecorderRef.current = null;
+    }
+    cleanupAudioContextAndTracks();
+    setPartialTranscript('');
+    setVoiceState('IDLE');
+    setVoiceMode(null);
+    voiceModeRef.current = null;
+  };
+
+  const handleProcessVoiceToText = async (audioBlob) => {
+    setVoiceState('TRANSCRIBING');
+    activeTurnIdRef.current++;
+    const currentTurn = activeTurnIdRef.current;
+
+    try {
+      await voice.processStream(
+        audioBlob,
+        null,
+        voiceLanguage,
+        null,
+        null,
+        (event) => {
+          if (activeTurnIdRef.current !== currentTurn) return;
+          if (event.event === 'voice_to_text_low_confidence') {
+            console.warn('Voice-to-Text low confidence:', event.low_confidence_reason || event.message, event.diagnostics);
+            setVoiceStatusMsg(event.message || "Couldn't confidently transcribe that. Please try again.");
+            setTimeout(() => setVoiceStatusMsg((prev) => prev.includes('confidently') ? '' : prev), 4500);
+          } else if (event.event === 'voice_to_text_completed') {
+            const finalNorm = event.normalized_text || event.raw_text || '';
+            if (finalNorm) {
+              setInput((prev) => (prev && prev.trim() ? `${prev.trim()} ${finalNorm}` : finalNorm));
+            }
+          } else if (event.event === 'empty') {
+            setVoiceStatusMsg(event.message || 'No audible speech detected.');
+            setTimeout(() => setVoiceStatusMsg((prev) => prev.includes('speech detected') ? '' : prev), 3500);
+          } else if (event.event === 'audio_diagnostics') {
+            console.debug('Voice input audio diagnostics:', event);
+          }
+        },
+        null,
+        currentTurn,
+        'DICTATION',
+        null
+      );
+    } catch (err) {
+      console.warn('Voice-to-Text streaming notice:', err);
+      try {
+        const directResult = await voice.transcribe(audioBlob, voiceLanguage);
+        if (directResult && directResult.text) {
+          const finalNorm = directResult.normalized_text || directResult.text;
+          setInput((prev) => (prev && prev.trim() ? `${prev.trim()} ${finalNorm}` : finalNorm));
+        } else if (directResult?.status === 'low_confidence') {
+          setVoiceStatusMsg("Couldn't confidently transcribe that. Please try again.");
+          setTimeout(() => setVoiceStatusMsg((prev) => prev.includes('confidently') ? '' : prev), 4500);
+        }
+      } catch (fallbackErr) {
+        setVoiceStatusMsg("Couldn't transcribe that. Please try again.");
+        setTimeout(() => setVoiceStatusMsg((prev) => prev.includes('transcribe') ? '' : prev), 4500);
+      }
+    } finally {
+      cleanupAudioContextAndTracks();
+      setPartialTranscript('');
+      setVoiceState('IDLE');
+      setVoiceMode(null);
+      voiceModeRef.current = null;
+    }
+  };
+
+  const toggleNormalVoiceInput = () => {
+    if (voiceMode === 'NOVA' && voiceState !== 'IDLE') {
+      return;
+    }
+    if (isDictating && (voiceState === 'VOICE_TO_TEXT_LISTENING' || voiceState === 'LISTENING')) {
+      stopVoiceToText();
+    } else if (isDictating && voiceState === 'TRANSCRIBING') {
+      return;
+    } else {
+      startVoiceToText();
     }
   };
 
@@ -784,6 +1250,13 @@ export default function ChatPage({ user }) {
         confirmedText,
         activeClarificationContext,
         (event) => {
+          // Guard: ignore stale events from previous turns or stopped Nova sessions
+          if (!voiceSessionIdRef.current || voiceModeRef.current !== 'NOVA') {
+            return;
+          }
+          if (event.voice_session_id && event.voice_session_id !== voiceSessionIdRef.current) {
+            return;
+          }
           if (activeTurnIdRef.current !== currentTurnId || (event.turn_id !== undefined && event.turn_id !== null && event.turn_id !== currentTurnId)) {
             return; // Ignore stale events from previous/aborted turns
           }
@@ -955,7 +1428,9 @@ export default function ChatPage({ user }) {
           }
         },
         abortController.signal,
-        currentTurnId
+        currentTurnId,
+        'NOVA',
+        voiceSessionIdRef.current
       );
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -1051,12 +1526,15 @@ export default function ChatPage({ user }) {
         if (msgs.length > 0) {
           const lastMsg = msgs[msgs.length - 1];
           if (lastMsg.role === 'assistant') {
+            if (result?.deliverable && !lastMsg.deliverable) lastMsg.deliverable = result.deliverable;
             if (result?.trace_id) lastMsg.trace_id = result.trace_id;
             if (result?.execution_trace) lastMsg.execution_trace = result.execution_trace;
             if (result?.verification) lastMsg.verification = result.verification;
             if (result?.model_id) lastMsg.model_id = result.model_id;
             if (result?.requires_human_review) lastMsg.requires_human_review = result.requires_human_review;
             if (result?.approval_id) lastMsg.approval_id = result.approval_id;
+            if (result?.analysis_id) lastMsg.analysis_id = result.analysis_id;
+            if (result?.image_hash) lastMsg.image_hash = result.image_hash;
           }
         }
         setMessages(msgs);
@@ -1177,7 +1655,7 @@ export default function ChatPage({ user }) {
     const token = localStorage.getItem('mrpl_token');
     const downloadPath = deliverable.download_url || `/api/documents/generated/${deliverable.output_id}/download`;
     const separator = downloadPath.includes('?') ? '&' : '?';
-    const url = `${downloadPath}${separator}inline=true${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+    const url = `${downloadPath}${separator}inline=true&t=${Date.now()}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
     window.open(url, '_blank');
   };
 
@@ -1185,7 +1663,7 @@ export default function ChatPage({ user }) {
     const token = localStorage.getItem('mrpl_token');
     const downloadPath = deliverable.download_url || `/api/documents/generated/${deliverable.output_id}/download`;
     const separator = downloadPath.includes('?') ? '&' : '?';
-    const url = `${downloadPath}${separator}inline=false${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+    const url = `${downloadPath}${separator}inline=false&t=${Date.now()}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
     const a = document.createElement('a');
     a.href = url;
     a.download = deliverable.filename || 'document';
@@ -1714,7 +2192,68 @@ export default function ChatPage({ user }) {
             </div>
           )}
 
+          {/* Normal Voice Input Live Transcription Bar */}
+          {isDictating && (voiceState === 'VOICE_TO_TEXT_LISTENING' || voiceState === 'TRANSCRIBING') && (
+            <div className="vtt-live-bar" id="vtt-live-bar">
+              <div className="vtt-indicator">
+                <span className="pulsing-dot-red"></span>
+                <span className="vtt-status-label">VOICE INPUT</span>
+                <span style={{ fontWeight: 600 }}>LIVE TRANSCRIPTION:</span>
+                <span className="vtt-preview-text">
+                  {partialTranscript ? `"${partialTranscript}"` : 'Listening... Speak now'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  type="button"
+                  className="btn-vtt-done"
+                  onClick={stopVoiceToText}
+                  title="Finish speaking and paste transcript into input box"
+                  id="btn-vtt-done"
+                >
+                  Done ✓
+                </button>
+                <button
+                  type="button"
+                  className="btn-vtt-cancel"
+                  onClick={cancelVoiceToText}
+                  title="Cancel voice input"
+                  id="btn-vtt-cancel"
+                >
+                  Cancel ✕
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="chat-input-wrapper">
+            {/* Nova Conversational Voice Assistant Control */}
+            <div className="voice-mode-controls">
+              {voiceMode === 'NOVA' && voiceState !== 'IDLE' ? (
+                <button
+                  type="button"
+                  className="btn-mode-nova active"
+                  onClick={stopNovaAssistant}
+                  title="Stop Nova Assistant"
+                  id="btn-stop-nova"
+                >
+                  <span className="pulsing-dot-red"></span>
+                  Stop Assistant
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-mode-nova"
+                  onClick={startNovaAssistant}
+                  disabled={sending || isDictating}
+                  title="Start Nova Conversational Voice Assistant"
+                  id="btn-start-nova"
+                >
+                  Nova
+                </button>
+              )}
+            </div>
+
             <input
               type="file"
               ref={fileInputRef}
@@ -1741,7 +2280,7 @@ export default function ChatPage({ user }) {
               <select
                 value={voiceLanguage}
                 onChange={(e) => setVoiceLanguage(e.target.value)}
-                disabled={voiceState === 'LISTENING' || voiceState === 'UNDERSTANDING' || sending}
+                disabled={(voiceMode === 'NOVA' && (voiceState === 'LISTENING' || voiceState === 'UNDERSTANDING')) || (isDictating && (voiceState === 'VOICE_TO_TEXT_LISTENING' || voiceState === 'TRANSCRIBING')) || sending}
                 aria-label="Voice language"
               >
                 <option value="auto">🌐 Auto</option>
@@ -1751,30 +2290,33 @@ export default function ChatPage({ user }) {
               </select>
             </div>
 
-            {/* Industrial Microphone Button */}
+            {/* Normal Voice Input (Dictation) Microphone Button */}
             <button
               type="button"
-              className={`chat-mic-btn ${voiceState.toLowerCase()}`}
-              onClick={toggleListening}
+              className={`chat-mic-btn ${
+                isDictating && voiceState === 'VOICE_TO_TEXT_LISTENING' ? 'listening' :
+                isDictating && voiceState === 'TRANSCRIBING' ? 'processing' :
+                voiceState === 'ERROR' ? 'error' : ''
+              }`}
+              onClick={toggleNormalVoiceInput}
+              disabled={sending || (voiceMode === 'NOVA' && voiceState !== 'IDLE')}
               title={
-                voiceState === 'LISTENING' ? 'Listening... Click or pause to submit' :
-                voiceState === 'UNDERSTANDING' ? 'Understanding speech...' :
-                voiceState === 'SEARCHING' ? 'Searching knowledge base...' :
-                voiceState === 'THINKING' ? 'Model thinking...' :
-                voiceState === 'SPEAKING' ? 'Assistant speaking — Click or speak to interrupt (barge-in)' :
-                'Speak question (English / Hindi / Marathi)'
+                voiceMode === 'NOVA' && voiceState !== 'IDLE' ? 'Nova Assistant is active' :
+                isDictating && voiceState === 'VOICE_TO_TEXT_LISTENING' ? 'Listening... Click to finish speaking' :
+                isDictating && voiceState === 'TRANSCRIBING' ? 'Transcribing speech...' :
+                voiceState === 'ERROR' ? (voiceStatusMsg || 'Microphone error') :
+                'Speak to type'
               }
               aria-label="Voice input"
+              id="btn-voice-input"
             >
-              {voiceState === 'LISTENING' ? (
+              {isDictating && voiceState === 'VOICE_TO_TEXT_LISTENING' ? (
                 <span className="voice-mic-active">
                   <span className="pulse-ring"></span>
                   🔴
                 </span>
-              ) : voiceState === 'UNDERSTANDING' || voiceState === 'SEARCHING' || voiceState === 'THINKING' ? (
+              ) : isDictating && voiceState === 'TRANSCRIBING' ? (
                 <span>◌</span>
-              ) : voiceState === 'SPEAKING' ? (
-                <span>🔊</span>
               ) : voiceState === 'ERROR' ? (
                 <span>⚠</span>
               ) : (
@@ -1913,7 +2455,8 @@ export default function ChatPage({ user }) {
       {/* Real-Time Conversational Voice Assistant Animation Modal */}
       <VoiceAssistantModal
         isOpen={voiceModalOpen}
-        onClose={closeVoiceModal}
+        onClose={stopNovaAssistant}
+        onStopAssistant={stopNovaAssistant}
         voiceState={voiceState}
         voiceLanguage={voiceLanguage}
         onLanguageChange={setVoiceLanguage}
@@ -1931,10 +2474,18 @@ export default function ChatPage({ user }) {
         analyser={analyserRef.current}
         activeSpokenText={activeSpokenText}
         activeClarificationPrompt={activeClarificationPrompt}
+        vadDiagnostics={vadDiagnostics}
+        micDiagnostics={micDiagnostics}
       />
 
       {/* 3D Interactive Robot Companion in the Chat Corner */}
-      <RobotCorner onRobotClick={toggleListening} />
+      <RobotCorner onRobotClick={() => {
+        if (voiceMode === 'NOVA' && voiceState !== 'IDLE') {
+          handleInterrupt();
+        } else {
+          startNovaAssistant();
+        }
+      }} />
     </div>
   );
 }

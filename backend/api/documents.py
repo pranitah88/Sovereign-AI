@@ -366,6 +366,8 @@ async def download_generated_document(
     disposition = "inline" if (view or inline) else "attachment"
     headers = {
         "Content-Disposition": f'{disposition}; filename="{file_record["original_name"]}"',
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
     }
 
     return FileResponse(

@@ -27,6 +27,153 @@ from backend.services.network_seal import record_local_call
 
 logger = logging.getLogger(__name__)
 
+# ── Vision Analysis Status Constants ─────────────────────────────────────
+VISION_STATUS_STARTED = "VISION_ANALYSIS_STARTED"
+VISION_STATUS_MODEL_SELECTED = "VISION_MODEL_SELECTED"
+VISION_STATUS_COMPLETED = "VISION_ANALYSIS_COMPLETED"
+VISION_STATUS_INFERENCE_FAILED = "VISION_INFERENCE_FAILED"
+VISION_STATUS_RETRY_STARTED = "VISION_RETRY_STARTED"
+VISION_STATUS_OCR_FALLBACK = "VISION_OCR_FALLBACK"
+VISION_STATUS_FAILED = "VISION_ANALYSIS_FAILED"
+VISION_STATUS_RELEVANCE_CHECKED = "VISION_RELEVANCE_CHECKED"
+VISION_STATUS_REQUIRES_REVIEW = "VISION_REQUIRES_REVIEW"
+VISION_STATUS_REPORT_GEN_STARTED = "VISION_REPORT_GENERATION_STARTED"
+VISION_STATUS_REPORT_GENERATED = "VISION_REPORT_GENERATED"
+PDF_STATUS_GEN_STARTED = "PDF_GENERATION_STARTED"
+PDF_STATUS_GENERATED = "PDF_GENERATED"
+PDF_STATUS_RETURNED = "PDF_RETURNED"
+VISION_STATUS_NOT_APPLICABLE = "VISION_NOT_APPLICABLE"
+
+# Verification result statuses (expanded from original)
+VERIFIED_NO_TAGS = "VERIFIED_NO_TAGS"
+VERIFIED_TAGS_FOUND = "VERIFIED_TAGS_FOUND"
+REQUIRES_REVIEW = "REQUIRES_REVIEW"
+
+# ── Vision-Specific Generation Configuration ─────────────────────────────
+# Conservative settings to prevent token repeat limit errors with qwen2.5-vl:3b.
+# These do NOT affect non-vision (text/RAG) tasks.
+VISION_GENERATION_OPTIONS = {
+    "temperature": 0.05,
+    "top_p": 0.8,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 64,
+    "num_predict": 512,
+}
+
+VISION_RETRY_OPTIONS = {
+    "temperature": 0.05,
+    "top_p": 0.8,
+    "repeat_penalty": 1.2,
+    "repeat_last_n": 64,
+    "num_predict": 256,
+}
+
+# Optical transcription options (used internally for visual evidence extraction)
+VISION_OCR_TRANSCRIPTION_OPTIONS = {
+    "temperature": 0.0,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 64,
+    "num_predict": 300,
+}
+
+
+@dataclass
+class VisionInferenceResult:
+    """Structured result from a vision model inference call.
+
+    Explicitly captures success vs. failure so downstream consumers
+    can never mistake a failed inference for a successful analysis
+    that found no content.
+    """
+    success: bool
+    text: str = ""
+    error: str = ""
+    error_code: str = ""     # "HTTP_500", "TIMEOUT", "TOKEN_REPEAT_LIMIT", "PREDICTION_ABORTED", etc.
+    source: str = ""         # "vision_model", "ocr", "combined", "retry"
+    retried: bool = False
+    analysis_id: str = ""
+    image_hash: str = ""
+    ocr_text: str = ""       # OCR-extracted text (if any), separate from vision
+    vision_model_text: str = ""  # Raw vision model output (if any)
+
+
+def is_vision_failure_response(status_code: int, response_text: str) -> bool:
+    """Detect whether a vision model response indicates a generation failure.
+
+    Primary detection:
+    - HTTP status != 200 (covers 500, 404, etc.)
+    - Empty or whitespace-only model output
+    - Known Ollama error patterns in response body
+
+    Defensive fallback:
+    - Response body containing error-like JSON patterns
+    """
+    # Primary: HTTP status
+    if status_code != 200:
+        return True
+
+    text_lower = (response_text or "").lower().strip()
+
+    # Primary: empty output
+    if not text_lower:
+        return True
+
+    # Primary: known Ollama error patterns
+    failure_patterns = [
+        "token repeat limit",
+        "prediction aborted",
+        "model not found",
+        "internal server error",
+        "out of memory",
+        "error loading model",
+        "context window exceeded",
+        '"error"',  # JSON error envelope from Ollama
+    ]
+    if any(p in text_lower for p in failure_patterns):
+        return True
+
+    return False
+
+
+def _classify_vision_error(status_code: int, response_text: str) -> str:
+    """Classify the type of vision inference error for tracing."""
+    text_lower = (response_text or "").lower()
+    if "token repeat limit" in text_lower:
+        return "TOKEN_REPEAT_LIMIT"
+    if "prediction aborted" in text_lower:
+        return "PREDICTION_ABORTED"
+    if status_code == 500 or "internal server error" in text_lower:
+        return "HTTP_500"
+    if status_code == 404 or "model not found" in text_lower:
+        return "MODEL_NOT_FOUND"
+    if "timeout" in text_lower or "timed out" in text_lower:
+        return "TIMEOUT"
+    if "out of memory" in text_lower:
+        return "OUT_OF_MEMORY"
+    if not (response_text or "").strip():
+        return "EMPTY_OUTPUT"
+    return f"HTTP_{status_code}"
+
+
+def build_short_vision_prompt(user_query: str) -> str:
+    """Build a short, structured prompt for vision tasks.
+
+    Designed to prevent token repetition by requesting concise output
+    in a numbered list format. Does NOT ask for lengthy analysis.
+    """
+    return (
+        "Describe this diagram or schematic concisely. Provide:\n"
+        "1. Overall diagram purpose (1 sentence)\n"
+        "2. Main visible components / unit labels\n"
+        "3. Flow direction and connections\n"
+        "4. Major stages or architecture layers\n"
+        "5. Clearly visible alphanumeric tags or IDs (if any)\n"
+        "6. Uncertain or unreadable labels\n\n"
+        "Do not repeat information. Do not invent labels not visible in the image. "
+        "Describe ONLY what can be visually supported.\n"
+        f"User question: {user_query}"
+    )
+
 # Known Authoritative MRPL Refinery Equipment Register (from Knowledge Base / P&IDs)
 KNOWN_EQUIPMENT_REGISTER = {
     # Crude Distillation Unit (CDU / VDU)
@@ -77,7 +224,17 @@ REFINERY_PROCESS_PATTERNS = [
 
 @dataclass
 class VisionVerificationReport:
-    status: str  # "VERIFIED_APPROVED" | "REQUIRES REVIEW" | "NO_VERIFIABLE_TAGS" | "FAILED"
+    """Report from vision verification pipeline.
+
+    status values:
+        VERIFIED_APPROVED  — image analyzed, all tags matched register
+        VERIFIED_NO_TAGS   — image analyzed successfully, no equipment tags visible
+        VERIFIED_TAGS_FOUND — alias for VERIFIED_APPROVED
+        REQUIRES_REVIEW    — image analyzed, some tags unregistered
+        VISION_ANALYSIS_FAILED — vision model inference failed
+        NO_VERIFIABLE_TAGS — legacy alias for VERIFIED_NO_TAGS (backward compat)
+    """
+    status: str
     drawing_name: str
     extracted_tags: list[str]
     matched_tags: list[dict]
@@ -85,6 +242,9 @@ class VisionVerificationReport:
     human_approval_id: int | None = None
     process_labels: list[str] = field(default_factory=list)
     summary: str = ""
+    vision_status: str = ""  # VISION_ANALYSIS_COMPLETED / VISION_ANALYSIS_FAILED / VISION_OCR_FALLBACK
+    vision_error: str = ""   # Original error message if vision failed
+    evidence_source: str = ""  # "vision_model", "ocr", "combined", "none"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +256,9 @@ class VisionVerificationReport:
             "human_approval_id": self.human_approval_id,
             "process_labels": self.process_labels,
             "summary": self.summary,
+            "vision_status": self.vision_status,
+            "vision_error": self.vision_error,
+            "evidence_source": self.evidence_source,
         }
 
 
@@ -238,15 +401,60 @@ def extract_visual_text_evidence(
     """
     Extract raw visible text evidence from an image using local on-premise vision capabilities.
     First attempts PaddleOCR if available, then uses the local multimodal vision model
-    in optical transcription mode (temperature=0.0).
+    in optical transcription mode.
+
+    Returns a plain string for backward compatibility.
+    For structured result with success/failure info, use extract_visual_text_evidence_v2().
     """
-    evidence_parts = []
+    result = extract_visual_text_evidence_v2(image_input, model_endpoint, model_name)
+    # Return combined text for backward compatibility
+    parts = []
+    if result.ocr_text:
+        parts.append(result.ocr_text)
+    if result.vision_model_text:
+        parts.append(result.vision_model_text)
+    if parts:
+        return "\n".join(parts)
+    return result.text
+
+
+def extract_visual_text_evidence_v2(
+    image_input: Path | str | bytes,
+    model_endpoint: str = "http://127.0.0.1:11434/api/generate",
+    model_name: str | None = None,
+    analysis_id: str = "",
+    image_hash: str = "",
+) -> VisionInferenceResult:
+    """
+    Extract raw visible text evidence from an image with structured success/failure tracking.
+
+    Pipeline:
+      1. Try PaddleOCR (if available)
+      2. Try vision model optical transcription
+      3. On vision failure: attempt ONE retry with shorter prompt and stricter config
+      4. If vision fails entirely but OCR succeeded: return OCR-derived result
+      5. If both fail: return explicit failure result
+
+    Returns VisionInferenceResult with explicit success/failure state.
+    """
+    ocr_text = ""
+    vision_text = ""
+    vision_failed = False
+    vision_error = ""
+    vision_error_code = ""
+    retried = False
 
     # Prepare raw bytes
     if isinstance(image_input, (str, Path)):
         p = Path(image_input)
         if not p.exists():
-            return ""
+            return VisionInferenceResult(
+                success=False,
+                error="Image file does not exist",
+                error_code="FILE_NOT_FOUND",
+                analysis_id=analysis_id,
+                image_hash=image_hash,
+            )
         with open(p, "rb") as f:
             raw_bytes = f.read()
     else:
@@ -258,12 +466,10 @@ def extract_visual_text_evidence(
         if isinstance(image_input, (str, Path)) and Path(image_input).exists():
             ocr_res = extract_text_from_image(str(image_input))
             ocr_text = ocr_res.get("text", "").strip()
-            if ocr_text:
-                evidence_parts.append(ocr_text)
     except Exception as e:
         logger.debug("OCR extraction skipped or unavailable: %s", e)
 
-    # 2. Local Multimodal Vision Optical Transcription (deterministic temperature 0.0)
+    # 2. Local Multimodal Vision Optical Transcription
     if not model_name:
         try:
             from backend.services.task_router import select_vision_model
@@ -273,6 +479,12 @@ def extract_visual_text_evidence(
         except Exception:
             model_name = "qwen2.5vl:3b"
 
+    transcription_prompt = (
+        "You are an optical text transcriber. Transcribe all visible text labels, "
+        "titles, unit names, and annotations printed in this image exactly as they appear. "
+        "Do not invent equipment IDs. Do not analyze. Output only the exact visible words."
+    )
+
     try:
         img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
         record_local_call(model_endpoint)
@@ -280,25 +492,146 @@ def extract_visual_text_evidence(
             model_endpoint,
             json={
                 "model": model_name,
-                "prompt": (
-                    "You are an optical text transcriber. Transcribe all visible text labels, "
-                    "titles, unit names, and annotations printed in this image exactly as they appear. "
-                    "Do not invent equipment IDs. Do not analyze. Output only the exact visible words."
-                ),
+                "prompt": transcription_prompt,
                 "images": [img_b64],
                 "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 300},
+                "options": VISION_OCR_TRANSCRIPTION_OPTIONS,
             },
             timeout=45,
         )
+
+        resp_text = ""
         if resp.status_code == 200:
-            vision_transcription = resp.json().get("response", "").strip()
-            if vision_transcription:
-                evidence_parts.append(vision_transcription)
+            resp_text = resp.json().get("response", "").strip()
+        else:
+            resp_text = resp.text
+
+        if is_vision_failure_response(resp.status_code, resp_text):
+            # First attempt failed — try ONE retry with stricter settings
+            vision_error = resp_text or f"HTTP {resp.status_code}"
+            vision_error_code = _classify_vision_error(resp.status_code, resp_text)
+            logger.warning(
+                "Vision optical transcription failed (attempt 1): %s — %s",
+                vision_error_code, vision_error[:200],
+            )
+
+            # Retry with shorter prompt and stricter config
+            retried = True
+            retry_prompt = "List all visible text in this image. Be brief."
+            try:
+                record_local_call(model_endpoint)
+                retry_resp = requests.post(
+                    model_endpoint,
+                    json={
+                        "model": model_name,
+                        "prompt": retry_prompt,
+                        "images": [img_b64],
+                        "stream": False,
+                        "options": VISION_RETRY_OPTIONS,
+                    },
+                    timeout=30,
+                )
+
+                retry_text = ""
+                if retry_resp.status_code == 200:
+                    retry_text = retry_resp.json().get("response", "").strip()
+                else:
+                    retry_text = retry_resp.text
+
+                if is_vision_failure_response(retry_resp.status_code, retry_text):
+                    # Retry also failed
+                    vision_failed = True
+                    vision_error = f"Retry also failed: {retry_text or f'HTTP {retry_resp.status_code}'}"
+                    vision_error_code = _classify_vision_error(retry_resp.status_code, retry_text)
+                    logger.warning("Vision optical transcription retry also failed: %s", vision_error[:200])
+                else:
+                    # Retry succeeded
+                    vision_text = retry_text
+                    vision_failed = False
+                    logger.info("Vision optical transcription succeeded on retry")
+
+            except Exception as retry_exc:
+                vision_failed = True
+                vision_error = f"Retry exception: {retry_exc}"
+                vision_error_code = "RETRY_EXCEPTION"
+                logger.warning("Vision retry exception: %s", retry_exc)
+        else:
+            # First attempt succeeded
+            vision_text = resp_text
+            vision_failed = False
+
     except Exception as exc:
+        vision_failed = True
+        vision_error = str(exc)
+        vision_error_code = "CONNECTION_ERROR"
         logger.warning("Optical text evidence extraction via vision model failed: %s", exc)
 
-    return "\n".join(evidence_parts)
+    # 3. Determine final result
+    combined_parts = []
+    if ocr_text:
+        combined_parts.append(ocr_text)
+    if vision_text:
+        combined_parts.append(vision_text)
+
+    if not vision_failed and vision_text:
+        # Vision succeeded (possibly combined with OCR)
+        source = "combined" if ocr_text else "vision_model"
+        return VisionInferenceResult(
+            success=True,
+            text="\n".join(combined_parts),
+            source=source,
+            retried=retried,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+            ocr_text=ocr_text,
+            vision_model_text=vision_text,
+        )
+    elif vision_failed and ocr_text:
+        # Vision failed but OCR has content — fallback
+        return VisionInferenceResult(
+            success=True,
+            text=ocr_text,
+            source="ocr",
+            retried=retried,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+            ocr_text=ocr_text,
+            vision_model_text="",
+            error=vision_error,
+            error_code=vision_error_code,
+        )
+    elif vision_failed:
+        # Both vision and OCR failed
+        return VisionInferenceResult(
+            success=False,
+            text="",
+            error=vision_error,
+            error_code=vision_error_code,
+            source="none",
+            retried=retried,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+        )
+    else:
+        # Vision returned empty but no error — use OCR if available
+        if ocr_text:
+            return VisionInferenceResult(
+                success=True,
+                text=ocr_text,
+                source="ocr",
+                retried=retried,
+                analysis_id=analysis_id,
+                image_hash=image_hash,
+                ocr_text=ocr_text,
+            )
+        return VisionInferenceResult(
+            success=True,
+            text="",
+            source="vision_model",
+            retried=retried,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+        )
 
 
 def build_grounded_vision_prompt(
@@ -310,33 +643,189 @@ def build_grounded_vision_prompt(
     """
     Constructs a zero-hallucination vision analysis prompt with mandatory 5-section structure.
     Strictly forbids inventing equipment tags, claiming MRPL attribution, or asserting compliance.
+    Supports both P&ID schematics and technical software / systems diagrams factually.
     """
     labels_hint = ", ".join(process_labels) if process_labels else "None detected"
     tags_hint = ", ".join(grounded_tags) if grounded_tags else "None visible"
 
     return (
-        "You are an objective industrial engineering vision system analyzing an engineering schematic or diagram.\n"
+        "You are an objective technical vision analysis system analyzing an engineering schematic, system architecture, or process diagram.\n"
         "STRICT GROUNDING MANDATE:\n"
-        "1. GROUNDING MANDATE: Only describe what is visibly depicted. Do NOT invent equipment tags, serial numbers, or asset IDs.\n"
+        "1. GROUNDING MANDATE: Only describe what is visibly depicted in the image. Do NOT invent labels, components, or IDs.\n"
         "2. NO INVENTED ATTRIBUTION: Do not claim or assume this diagram belongs to MRPL or any specific plant unless an official plant logo or ownership title block is visibly legible.\n"
         "3. NO SPECULATIVE COMPLIANCE: Do not claim engineering compliance, code adherence, or safety certification from the diagram alone.\n"
-        "4. EQUIPMENT TAG DISTINCTION: Note the difference between general process block labels (e.g. 'Furnace', 'Atmospheric Distillation', 'Gas Oil') and specific equipment tags (e.g. '11-P-101A'). Do not classify process labels as equipment tags.\n\n"
+        "4. LABELS AND IDENTIFIERS: Distinguish between general descriptive block labels and specific alphanumeric equipment/component IDs.\n\n"
         f"EXTRACTED VISUAL EVIDENCE FROM IMAGE:\n"
-        f"- Visible Process Labels Detected: {labels_hint}\n"
-        f"- Verifiable Equipment Tags Visible: {tags_hint}\n\n"
+        f"- Visible Labels Detected: {labels_hint}\n"
+        f"- Verifiable Equipment/Component Tags Visible: {tags_hint}\n\n"
         f"User Inquiry: {user_query}\n\n"
         "Structure your response strictly into the following 5 numbered sections:\n"
         "### 1. Visually Observed Elements\n"
-        "Describe only the visibly rendered shapes, units, flow arrows, text labels, and streams present in the image.\n\n"
+        "Describe only the visibly rendered shapes, modules, units, flow arrows, text labels, and connection streams present in the image.\n\n"
         "### 2. Process Interpretation\n"
-        "Explain the high-level refining process flow depicted (feedstocks, intermediate separations, cracking, conversion, products) based strictly on visible labels.\n\n"
+        "Explain the high-level system architecture, process stages, data flow, or conversion steps depicted, based strictly on visible labels and connection pathways.\n\n"
         "### 3. Verifiable Equipment Tags\n"
-        "List only verified alphanumeric equipment tags that are physically legible in the image. If none are visible, explicitly state: 'No verifiable equipment tags detected. The diagram contains process-unit/stream labels rather than equipment IDs.'\n\n"
+        "List only verified alphanumeric equipment tags or component IDs that are physically legible in the image. If none are visible, explicitly state: 'No verifiable equipment tags detected. The diagram contains functional block/module labels rather than equipment IDs.'\n\n"
         "### 4. Registry Verification\n"
-        "State whether equipment tags could be verified against an asset database. If no equipment tags are visible, explicitly state: 'No equipment registry verification performed (no equipment tags present).'\n\n"
+        "State whether equipment tags could be verified against an asset database. If the diagram depicts general technical/software architecture or has no refinery tags, explicitly state: 'No equipment registry verification performed (general technical schematic / no refinery equipment tags present).'\n\n"
         "### 5. Uncertainty / Review Required\n"
-        "Identify any ambiguities, low-resolution regions, unverified assumptions, or missing instrumentation details.\n"
+        "Identify any ambiguities, low-resolution regions, unverified assumptions, unreadable labels, or missing connection details.\n"
     )
+
+
+def run_vision_analysis(
+    image_bytes: bytes,
+    user_query: str,
+    model_endpoint: str = "http://127.0.0.1:11434/api/generate",
+    model_name: str = "qwen2.5vl:3b",
+    visual_evidence: str = "",
+    process_labels: list[str] | None = None,
+    grounded_tags: list[str] | None = None,
+    analysis_id: str = "",
+    image_hash: str = "",
+) -> VisionInferenceResult:
+    """Run the full vision analysis inference call.
+
+    This is the SINGLE OWNER of the main Ollama vision analysis call.
+    chat.py must call this function instead of making its own requests.post().
+
+    Pipeline:
+      1. Send grounded 5-section prompt to vision model with VISION_GENERATION_OPTIONS
+      2. On failure: retry ONCE with build_short_vision_prompt() and VISION_RETRY_OPTIONS
+      3. Return structured VisionInferenceResult
+
+    Args:
+        image_bytes: Raw image bytes (already read from file)
+        user_query: The user's original query
+        model_endpoint: Ollama API endpoint
+        model_name: Ollama model name
+        visual_evidence: Pre-extracted visual text evidence for the grounded prompt
+        process_labels: Pre-extracted process labels
+        grounded_tags: Pre-extracted grounded equipment tags
+        analysis_id: Unique analysis identifier for tracing
+        image_hash: SHA-256 hash of current image bytes
+    """
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Build the full grounded prompt
+    system_prompt = build_grounded_vision_prompt(
+        user_query=user_query,
+        visual_evidence=visual_evidence,
+        process_labels=process_labels,
+        grounded_tags=grounded_tags,
+    )
+
+    # Attempt 1: Full grounded analysis
+    try:
+        record_local_call(model_endpoint)
+        resp = requests.post(
+            model_endpoint,
+            json={
+                "model": model_name,
+                "prompt": system_prompt,
+                "images": [img_b64],
+                "stream": False,
+                "options": VISION_GENERATION_OPTIONS,
+            },
+            timeout=60,
+        )
+
+        resp_text = ""
+        if resp.status_code == 200:
+            resp_text = resp.json().get("response", "").strip()
+        else:
+            resp_text = resp.text
+
+        if not is_vision_failure_response(resp.status_code, resp_text):
+            # Success on first attempt
+            return VisionInferenceResult(
+                success=True,
+                text=resp_text,
+                source="vision_model",
+                retried=False,
+                analysis_id=analysis_id,
+                image_hash=image_hash,
+                vision_model_text=resp_text,
+            )
+
+        # First attempt failed — classify error
+        first_error = resp_text or f"HTTP {resp.status_code}"
+        first_error_code = _classify_vision_error(resp.status_code, resp_text)
+        logger.warning(
+            "Vision analysis failed (attempt 1): %s — %s",
+            first_error_code, first_error[:200],
+        )
+
+    except requests.exceptions.Timeout:
+        first_error = "Request timed out after 60s"
+        first_error_code = "TIMEOUT"
+        logger.warning("Vision analysis timed out (attempt 1)")
+    except Exception as exc:
+        first_error = str(exc)
+        first_error_code = "CONNECTION_ERROR"
+        logger.warning("Vision analysis exception (attempt 1): %s", exc)
+
+    # Attempt 2: Retry with shorter prompt and stricter options
+    retry_prompt = build_short_vision_prompt(user_query)
+    try:
+        record_local_call(model_endpoint)
+        retry_resp = requests.post(
+            model_endpoint,
+            json={
+                "model": model_name,
+                "prompt": retry_prompt,
+                "images": [img_b64],
+                "stream": False,
+                "options": VISION_RETRY_OPTIONS,
+            },
+            timeout=45,
+        )
+
+        retry_text = ""
+        if retry_resp.status_code == 200:
+            retry_text = retry_resp.json().get("response", "").strip()
+        else:
+            retry_text = retry_resp.text
+
+        if not is_vision_failure_response(retry_resp.status_code, retry_text):
+            # Retry succeeded
+            logger.info("Vision analysis succeeded on retry")
+            return VisionInferenceResult(
+                success=True,
+                text=retry_text,
+                source="vision_model",
+                retried=True,
+                analysis_id=analysis_id,
+                image_hash=image_hash,
+                vision_model_text=retry_text,
+            )
+
+        # Retry also failed
+        retry_error = retry_text or f"HTTP {retry_resp.status_code}"
+        retry_error_code = _classify_vision_error(retry_resp.status_code, retry_text)
+        logger.warning("Vision analysis retry also failed: %s — %s", retry_error_code, retry_error[:200])
+
+        return VisionInferenceResult(
+            success=False,
+            error=f"Initial: {first_error}; Retry: {retry_error}",
+            error_code=first_error_code,
+            source="none",
+            retried=True,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+        )
+
+    except Exception as retry_exc:
+        logger.warning("Vision analysis retry exception: %s", retry_exc)
+        return VisionInferenceResult(
+            success=False,
+            error=f"Initial: {first_error}; Retry exception: {retry_exc}",
+            error_code=first_error_code,
+            source="none",
+            retried=True,
+            analysis_id=analysis_id,
+            image_hash=image_hash,
+        )
 
 
 def verify_pid_drawing(

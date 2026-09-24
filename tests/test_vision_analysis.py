@@ -36,7 +36,16 @@ from backend.services.vision_verification import (
     extract_process_labels,
     extract_grounded_equipment_tags,
     is_tag_grounded_in_visual_evidence,
+    is_vision_failure_response,
+    run_vision_analysis,
+    build_short_vision_prompt,
+    VisionInferenceResult,
     KNOWN_EQUIPMENT_REGISTER,
+    VISION_STATUS_COMPLETED,
+    VISION_STATUS_FAILED,
+    VISION_STATUS_OCR_FALLBACK,
+    VISION_GENERATION_OPTIONS,
+    VISION_RETRY_OPTIONS,
 )
 
 
@@ -137,8 +146,8 @@ def test_01_png_upload(client: TestClient):
     assert "RBAC_CHECK" in events
     assert "VISION_MODEL_SELECTED" in events
     assert "OLLAMA_INFERENCE" in events
-    assert "VISION_ANALYSIS" in events
-    assert "VERIFICATION" in events
+    assert "VISION_ANALYSIS_COMPLETED" in events
+    assert "VISION_VERIFICATION_COMPLETED" in events
     assert "AUDIT" in events
 
 
@@ -508,3 +517,746 @@ def test_11_refinery_diagram_regression(client: TestClient):
     ]
     assert len(drawing_approvals) == 0, f"False approval proposal created: {drawing_approvals}"
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VISION FAILURE HANDLING TESTS (12-29)
+# Tests for fail-closed behavior when vision model returns errors.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── 12. HTTP 500 from Vision Model ────────────────────────────────────────────
+
+def test_12_vision_model_http_500(client: TestClient):
+    """
+    When qwen2.5-vl:3b returns HTTP 500, the endpoint must:
+    - NOT return status="success"
+    - NOT claim "No Verifiable Equipment Tags"
+    - NOT produce process label claims
+    - Return a controlled failure message
+    """
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "HTTP 500 Vision Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    # Mock Ollama returning HTTP 500
+    mock_500 = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_500):
+        files = {"file": ("diagram.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this diagram"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    assert res.status_code == 200
+    body = res.json()
+
+    # FAIL CLOSED assertions
+    assert body["status"] == "vision_failed"
+    assert body["vision_status"] == VISION_STATUS_FAILED
+    assert body["verification"]["status"] == "VISION_ANALYSIS_FAILED"
+    assert body["verification"]["is_approved"] is False
+    assert len(body["verification"]["equipment_tags"]) == 0
+    assert len(body["verification"]["process_labels"]) == 0
+
+    # Must NOT contain fabricated claims
+    msg = body["message"]
+    assert "No Verifiable Equipment Tags" not in msg
+    assert "Detected Process Labels" not in msg
+    assert "Response Verified" not in msg
+
+    # Must contain controlled failure message
+    assert "Visual analysis could not be completed" in msg
+    assert "No visual conclusions were made" in msg
+
+    # Raw error must NOT be exposed to user
+    assert body["vision_error"] == ""
+
+
+# ── 13. Token Repeat Limit Failure ────────────────────────────────────────────
+
+def test_13_token_repeat_limit_failure(client: TestClient):
+    """
+    Exact reproduction of the reported bug:
+    qwen2.5-vl:3b HTTP 500 'prediction aborted, token repeat limit reached'
+    Must return VISION_ANALYSIS_FAILED, not 'No Verifiable Equipment Tags'.
+    """
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Token Repeat Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_error = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_error):
+        files = {"file": ("refinery_flow.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this diagram"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert body["vision_status"] == VISION_STATUS_FAILED
+    assert body["verification"]["status"] == "VISION_ANALYSIS_FAILED"
+    assert "No Verifiable Equipment Tags" not in body["message"]
+    assert body["analysis"] == ""
+
+
+# ── 14. Timeout from Vision Model ─────────────────────────────────────────────
+
+def test_14_vision_model_timeout(client: TestClient):
+    """Vision model timeout must result in VISION_ANALYSIS_FAILED."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Timeout Vision Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    import requests as req_mod
+    with patch("requests.post", side_effect=req_mod.exceptions.Timeout("Connection timed out")):
+        files = {"file": ("timeout.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "analyze this"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert body["vision_status"] == VISION_STATUS_FAILED
+    assert body["verification"]["status"] == "VISION_ANALYSIS_FAILED"
+    assert "Visual analysis could not be completed" in body["message"]
+
+
+# ── 15. Empty Output from Vision Model ────────────────────────────────────────
+
+def test_15_vision_model_empty_output(client: TestClient):
+    """Vision model returning empty string must be detected as failure."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Empty Output Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_empty = _make_mock_response({"response": ""}, status_code=200)
+
+    with patch("requests.post", return_value=mock_empty):
+        files = {"file": ("empty.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert body["vision_status"] == VISION_STATUS_FAILED
+    assert body["verification"]["status"] == "VISION_ANALYSIS_FAILED"
+
+
+# ── 16. Exactly One Retry Only ────────────────────────────────────────────────
+
+def test_16_exactly_one_retry():
+    """run_vision_analysis must attempt exactly ONE retry, not unlimited."""
+    # Track calls to requests.post
+    call_count = 0
+
+    def mock_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _make_mock_response(
+            {"error": "prediction aborted, token repeat limit reached"},
+            status_code=500,
+        )
+
+    with patch("requests.post", side_effect=mock_post):
+        with patch("backend.services.vision_verification.record_local_call"):
+            result = run_vision_analysis(
+                image_bytes=VALID_PNG_BYTES,
+                user_query="explain this diagram",
+            )
+
+    assert result.success is False
+    assert result.retried is True
+    # Exactly 2 calls: initial + 1 retry
+    assert call_count == 2
+
+
+# ── 17. Retry Failure Stops ───────────────────────────────────────────────────
+
+def test_17_retry_failure_stops():
+    """When both initial and retry fail, VISION_ANALYSIS_FAILED is returned."""
+    mock_fail = _make_mock_response(
+        {"error": "token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_fail):
+        with patch("backend.services.vision_verification.record_local_call"):
+            result = run_vision_analysis(
+                image_bytes=VALID_PNG_BYTES,
+                user_query="analyze this",
+            )
+
+    assert result.success is False
+    assert result.retried is True
+    assert result.error_code in ["TOKEN_REPEAT_LIMIT", "HTTP_500"]
+    assert result.source == "none"
+
+
+# ── 18. Successful Retry ──────────────────────────────────────────────────────
+
+def test_18_successful_retry():
+    """If initial attempt fails but retry succeeds, result should be success."""
+    call_count = 0
+
+    def mock_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call fails
+            return _make_mock_response(
+                {"error": "prediction aborted"},
+                status_code=500,
+            )
+        else:
+            # Retry succeeds
+            return _make_mock_response(
+                {"response": "This diagram shows a crude distillation process."},
+                status_code=200,
+            )
+
+    with patch("requests.post", side_effect=mock_post):
+        with patch("backend.services.vision_verification.record_local_call"):
+            result = run_vision_analysis(
+                image_bytes=VALID_PNG_BYTES,
+                user_query="explain this diagram",
+            )
+
+    assert result.success is True
+    assert result.retried is True
+    assert "crude distillation" in result.text.lower()
+    assert call_count == 2
+
+
+# ── 19. OCR Fallback After Vision Failure ─────────────────────────────────────
+
+def test_19_ocr_fallback_on_vision_failure(client: TestClient):
+    """When vision fails but OCR succeeds, response is OCR-derived."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "OCR Fallback Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    # Mock: vision model fails, but OCR returns text
+    mock_500 = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    ocr_mock_result = {
+        "text": "Crude Oil\nFurnace\nAtmospheric Distillation\nGas Oil",
+        "confidence": 0.92,
+        "line_count": 4,
+        "lines": [],
+    }
+
+    with patch("requests.post", return_value=mock_500):
+        with patch(
+            "backend.services.ocr.extract_text_from_image",
+            return_value=ocr_mock_result,
+        ):
+            files = {"file": ("ocr_test.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+            data = {"prompt": "explain this diagram"}
+            res = client.post(
+                f"/api/chat/sessions/{session_id}/image-analysis",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+
+    body = res.json()
+    assert body["vision_status"] == VISION_STATUS_OCR_FALLBACK
+    # OCR fallback response must indicate OCR-derived
+    assert "OCR" in body["message"]
+    assert "visual understanding" not in body["message"].lower() or "do not represent full visual understanding" in body["message"].lower()
+
+    # Trace must include OCR fallback event
+    events = [e["event"] for e in body["execution_trace"]]
+    assert "VISION_OCR_FALLBACK" in events
+    assert "VISION_ANALYSIS_FAILED" not in events  # OCR fallback is NOT full failure
+
+
+# ── 20. Both Vision and OCR Fail ──────────────────────────────────────────────
+
+def test_20_both_vision_and_ocr_fail(client: TestClient):
+    """When both vision and OCR fail, controlled failure response."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Both Fail Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_500 = _make_mock_response(
+        {"error": "prediction aborted"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_500):
+        with patch(
+            "backend.services.ocr.extract_text_from_image",
+            side_effect=ImportError("PaddleOCR not available"),
+        ):
+            files = {"file": ("both_fail.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+            data = {"prompt": "explain this diagram"}
+            res = client.post(
+                f"/api/chat/sessions/{session_id}/image-analysis",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+
+    body = res.json()
+    assert body["status"] == "vision_failed"
+    assert body["vision_status"] == VISION_STATUS_FAILED
+    assert "Visual analysis could not be completed" in body["message"]
+    assert body["analysis"] == ""
+
+    # Trace must include VISION_ANALYSIS_FAILED
+    events = [e["event"] for e in body["execution_trace"]]
+    assert "VISION_ANALYSIS_FAILED" in events
+
+
+# ── 21. Successful Vision With No Tags (VERIFIED_NO_TAGS) ─────────────────────
+
+def test_21_successful_vision_no_tags(client: TestClient):
+    """
+    When vision succeeds and genuinely finds no equipment tags, the status
+    must be VERIFIED_NO_TAGS (not VISION_ANALYSIS_FAILED).
+    """
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "No Tags Success Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    # Vision model succeeds with a valid analysis containing no equipment tags
+    mock_success = _make_mock_response(
+        {"response": "This diagram shows a generic process flow. No specific equipment tags are visible."},
+        status_code=200,
+    )
+
+    with patch("requests.post", return_value=mock_success):
+        files = {"file": ("notags.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this diagram"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["vision_status"] == VISION_STATUS_COMPLETED
+    assert body["verification"]["status"] == "NO_VERIFIABLE_TAGS"
+    assert body["verification"]["is_approved"] is True
+    # This is NOT a failed analysis
+    assert "Visual analysis could not be completed" not in body["message"]
+
+
+# ── 22. Successful Vision With Valid Tags ─────────────────────────────────────
+
+def test_22_successful_vision_with_valid_tags(client: TestClient):
+    """Vision succeeds and finds valid registered equipment tags → VERIFIED."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Valid Tags Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_success = _make_mock_response(
+        {"response": "P&ID shows Crude Distillation Tower 11-C-101 and pump 11-P-101A in service."},
+        status_code=200,
+    )
+
+    with patch("requests.post", return_value=mock_success):
+        files = {"file": ("tags.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "analyze this P&ID"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["vision_status"] == VISION_STATUS_COMPLETED
+    assert body["verification"]["status"] == "VERIFIED"
+    assert body["verification"]["is_approved"] is True
+    assert "11-C-101" in body["verification"]["equipment_tags"]
+    assert "11-P-101A" in body["verification"]["equipment_tags"]
+
+
+# ── 23. Failed Vision Does NOT Produce "No Verifiable Equipment Tags" ─────────
+
+def test_23_failed_vision_no_verifiable_tags_claim(client: TestClient):
+    """
+    CRITICAL: A failed vision analysis must NEVER produce the string
+    'No Verifiable Equipment Tags' — that implies successful analysis.
+    """
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "No False Tags Claim"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_fail = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_fail):
+        files = {"file": ("fail.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this diagram"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    msg = body["message"]
+    assert "No Verifiable Equipment Tags" not in msg
+    assert body["verification"]["status"] != "NO_VERIFIABLE_TAGS"
+    assert body["verification"]["status"] == "VISION_ANALYSIS_FAILED"
+
+
+# ── 24. Failed Vision Does NOT Produce "Detected Process Labels" ──────────────
+
+def test_24_failed_vision_no_process_labels_claim(client: TestClient):
+    """
+    Failed vision analysis must NOT produce 'Detected Process Labels: ...'
+    unless those labels came from a verified OCR fallback.
+    """
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "No False Labels"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_fail = _make_mock_response(
+        {"error": "prediction aborted"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_fail):
+        files = {"file": ("nolabels.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "analyze"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert "Detected Process Labels" not in body["message"]
+    # Process labels list must be empty when vision failed
+    assert len(body["verification"]["process_labels"]) == 0
+
+
+# ── 25. Failed Vision Does NOT Produce "Response Verified" ────────────────────
+
+def test_25_failed_vision_no_response_verified(client: TestClient):
+    """Failed vision analysis must NOT end with 'Response Verified' or similar."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "No Response Verified"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_fail = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_fail):
+        files = {"file": ("novrfy.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    assert "Response Verified" not in body["message"]
+
+    # Trace must NOT contain VISION_VERIFICATION_COMPLETED
+    events = [e["event"] for e in body["execution_trace"]]
+    assert "VISION_VERIFICATION_COMPLETED" not in events
+
+
+# ── 26. Execution Trace for Failure ───────────────────────────────────────────
+
+def test_26_execution_trace_failure(client: TestClient):
+    """Verify failure execution trace contains expected events in order."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Trace Failure Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_fail = _make_mock_response(
+        {"error": "prediction aborted, token repeat limit reached"},
+        status_code=500,
+    )
+
+    with patch("requests.post", return_value=mock_fail):
+        files = {"file": ("trace_fail.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "explain this diagram"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    events = [e["event"] for e in body["execution_trace"]]
+
+    # Required events for failure
+    assert "VISION_MODEL_SELECTED" in events
+    assert "VISION_ANALYSIS_STARTED" in events
+    assert "VISION_INFERENCE_FAILED" in events
+    assert "VISION_ANALYSIS_FAILED" in events
+    assert "AUDIT" in events
+
+    # Must NOT have successful verification events
+    assert "VISION_VERIFICATION_COMPLETED" not in events
+    assert "VISION_ANALYSIS_COMPLETED" not in events
+
+    # Check that the inference failure has error details preserved
+    failed_events = [e for e in body["execution_trace"] if e["event"] == "VISION_INFERENCE_FAILED"]
+    assert len(failed_events) > 0
+    for fe in failed_events:
+        details = fe.get("details", {})
+        # Error details must be preserved internally
+        assert details.get("error_code") or details.get("error")
+
+
+# ── 27. Execution Trace for Success ───────────────────────────────────────────
+
+def test_27_execution_trace_success(client: TestClient):
+    """Verify success execution trace contains expected events."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Trace Success Test"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_success = _make_mock_response(
+        {"response": "P&ID shows Atmospheric Distillation Column 11-C-101."},
+        status_code=200,
+    )
+
+    with patch("requests.post", return_value=mock_success):
+        files = {"file": ("trace_ok.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+        data = {"prompt": "analyze this P&ID"}
+        res = client.post(
+            f"/api/chat/sessions/{session_id}/image-analysis",
+            files=files,
+            data=data,
+            headers=headers,
+        )
+
+    body = res.json()
+    events = [e["event"] for e in body["execution_trace"]]
+
+    # Required events for success
+    assert "IMAGE_RECEIVED" in events
+    assert "FILE_VALIDATED" in events
+    assert "RBAC_CHECK" in events
+    assert "VISION_MODEL_SELECTED" in events
+    assert "VISION_ANALYSIS_STARTED" in events
+    assert "OLLAMA_INFERENCE" in events
+    assert "VISION_ANALYSIS_COMPLETED" in events
+    assert "VISION_VERIFICATION_COMPLETED" in events
+    assert "AUDIT" in events
+
+    # Must NOT have failure events
+    assert "VISION_ANALYSIS_FAILED" not in events
+    assert "VISION_INFERENCE_FAILED" not in events
+
+
+# ── 28. Execution Trace for OCR Fallback ──────────────────────────────────────
+
+def test_28_execution_trace_ocr_fallback(client: TestClient):
+    """Verify OCR fallback execution trace."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session_res = client.post("/api/chat/sessions", json={"title": "Trace OCR Fallback"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    mock_500 = _make_mock_response(
+        {"error": "prediction aborted"},
+        status_code=500,
+    )
+    ocr_result = {
+        "text": "Crude Oil\nGas Oil\nFurnace",
+        "confidence": 0.9,
+        "line_count": 3,
+        "lines": [],
+    }
+
+    with patch("requests.post", return_value=mock_500):
+        with patch(
+            "backend.services.ocr.extract_text_from_image",
+            return_value=ocr_result,
+        ):
+            files = {"file": ("ocr_trace.png", io.BytesIO(VALID_PNG_BYTES), "image/png")}
+            data = {"prompt": "explain"}
+            res = client.post(
+                f"/api/chat/sessions/{session_id}/image-analysis",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+
+    body = res.json()
+    events = [e["event"] for e in body["execution_trace"]]
+
+    assert "VISION_OCR_FALLBACK" in events
+    assert "VISION_ANALYSIS_FAILED" not in events  # OCR fallback is partial, not full fail
+
+
+# ── 29. Non-Vision RAG Behavior Unchanged ─────────────────────────────────────
+
+def test_29_non_vision_rag_unchanged(client: TestClient):
+    """Existing text chat and RAG workflows must not be affected by vision changes."""
+    token = _get_token(client, "engineer")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Standard text message flow
+    session_res = client.post("/api/chat/sessions", json={"title": "RAG Regression Session"}, headers=headers)
+    assert session_res.status_code in [200, 201]
+    session_id = session_res.json()["id"]
+
+    msg_res = client.post(
+        f"/api/chat/sessions/{session_id}/messages",
+        json={"content": "What is the throughput capacity of the CDU?"},
+        headers=headers,
+    )
+    assert msg_res.status_code == 201
+    assert msg_res.json()["role"] == "user"
+
+    # Session listing still works
+    list_res = client.get("/api/chat/sessions", headers=headers)
+    assert list_res.status_code == 200
+    assert len(list_res.json()) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIT TESTS FOR VISION SERVICE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestIsVisionFailureResponse:
+    """Unit tests for is_vision_failure_response()."""
+
+    def test_http_500_is_failure(self):
+        assert is_vision_failure_response(500, '{"error":"something"}') is True
+
+    def test_http_200_with_valid_text_is_success(self):
+        assert is_vision_failure_response(200, "This diagram shows a process flow") is False
+
+    def test_http_200_with_empty_text_is_failure(self):
+        assert is_vision_failure_response(200, "") is True
+        assert is_vision_failure_response(200, "   ") is True
+
+    def test_http_200_with_token_repeat_is_failure(self):
+        assert is_vision_failure_response(200, "token repeat limit reached") is True
+
+    def test_http_200_with_prediction_aborted_is_failure(self):
+        assert is_vision_failure_response(200, "prediction aborted") is True
+
+    def test_http_404_is_failure(self):
+        assert is_vision_failure_response(404, "model not found") is True
+
+    def test_http_200_with_json_error_envelope(self):
+        assert is_vision_failure_response(200, '{"error":"something went wrong"}') is True
+
+
+class TestBuildShortVisionPrompt:
+    """Unit tests for the short vision prompt builder."""
+
+    def test_prompt_contains_numbered_items(self):
+        prompt = build_short_vision_prompt("explain this diagram")
+        assert "1." in prompt
+        assert "2." in prompt
+        assert "3." in prompt
+        assert "4." in prompt
+        assert "5." in prompt
+        assert "6." in prompt
+
+    def test_prompt_contains_user_query(self):
+        prompt = build_short_vision_prompt("what is this process?")
+        assert "what is this process?" in prompt
+
+    def test_prompt_anti_hallucination_instructions(self):
+        prompt = build_short_vision_prompt("explain")
+        assert "Do not repeat" in prompt
+        assert "Do not invent" in prompt
+
+
+class TestVisionGenerationConfig:
+    """Unit tests for vision generation configuration."""
+
+    def test_vision_options_conservative(self):
+        assert VISION_GENERATION_OPTIONS["temperature"] == 0.05
+        assert VISION_GENERATION_OPTIONS["repeat_penalty"] == 1.1
+        assert VISION_GENERATION_OPTIONS["num_predict"] in (512, 1024)
+
+    def test_retry_options_stricter(self):
+        assert VISION_RETRY_OPTIONS["repeat_penalty"] > VISION_GENERATION_OPTIONS["repeat_penalty"]
+        assert VISION_RETRY_OPTIONS["num_predict"] < VISION_GENERATION_OPTIONS["num_predict"]
+
+    def test_retry_options_lower_output_limit(self):
+        assert VISION_RETRY_OPTIONS["num_predict"] == 256

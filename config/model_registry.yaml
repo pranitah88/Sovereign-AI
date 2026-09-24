@@ -128,6 +128,27 @@ task_type_routing:
     requires_rag: false
     requires_sandbox: false
 
+  CLARIFICATION:
+    preferred_tags:
+      - general_reasoning
+    required_tools: []
+    requires_rag: false
+    requires_sandbox: false
+
+  INCOMPLETE_QUERY:
+    preferred_tags:
+      - general_reasoning
+    required_tools: []
+    requires_rag: false
+    requires_sandbox: false
+
+  AMBIGUOUS_QUERY:
+    preferred_tags:
+      - general_reasoning
+    required_tools: []
+    requires_rag: false
+    requires_sandbox: false
+
   VISION:
     preferred_tags:
       - image_understanding

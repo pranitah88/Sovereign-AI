@@ -98,6 +98,8 @@ async def process_voice_query(
     language: str = Form(None),
     confirmed_query: str | None = Form(None),
     clarification_context: str | None = Form(None),
+    voice_mode: str = Form("NOVA"),
+    voice_session_id: str | None = Form(None),
 ):
     """
     Full sovereign voice pipeline:
@@ -146,6 +148,8 @@ async def process_voice_query(
         language_hint=language,
         confirmed_query=confirmed_query,
         clarification_context=clarification_context,
+        voice_mode=voice_mode,
+        voice_session_id=voice_session_id,
     )
 
     if result.get("status") == "error":
@@ -196,6 +200,8 @@ async def process_voice_stream(
     confirmed_query: str | None = Form(None),
     clarification_context: str | None = Form(None),
     turn_id: int | None = Form(None),
+    voice_mode: str = Form("NOVA"),
+    voice_session_id: str | None = Form(None),
 ):
     """
     Real-time conversational streaming voice pipeline (SSE):
@@ -246,11 +252,13 @@ async def process_voice_stream(
                 confirmed_query=confirmed_query,
                 clarification_context=clarification_context,
                 turn_id=turn_id,
+                voice_mode=voice_mode,
+                voice_session_id=voice_session_id,
             ):
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:
             logger.error("SSE stream error in process_voice_stream: %s", exc, exc_info=True)
-            yield f"data: {json.dumps({'event': 'error', 'error': str(exc), 'turn_id': turn_id})}\n\n"
+            yield f"data: {json.dumps({'event': 'error', 'error': str(exc), 'turn_id': turn_id, 'voice_session_id': voice_session_id})}\n\n"
 
     return StreamingResponse(sse_event_generator(), media_type="text/event-stream")
 
@@ -278,6 +286,7 @@ async def partial_transcribe_speech(
 async def interrupt_voice(
     user: Annotated[dict, Depends(require_permission("voice"))],
     session_id: int | None = Form(None),
+    voice_session_id: str | None = Form(None),
 ):
     """
     Barge-in interruption signal from client. Immediately stops server-side audio generation.
@@ -292,9 +301,42 @@ async def interrupt_voice(
             user_id=user["id"],
             username=user.get("username", "anonymous"),
             target=f"session:{session_id or 'direct'}",
-            details={"reason": "User barge-in detected"},
+            details={"reason": "User barge-in detected", "voice_session_id": voice_session_id},
         )
     except Exception as exc:
         logger.warning("Could not log voice interruption: %s", exc)
 
-    return {"status": "interrupted", "session_id": session_id}
+    return {"status": "interrupted", "session_id": session_id, "voice_session_id": voice_session_id}
+
+
+@router.post("/stop")
+async def stop_voice_assistant(
+    user: Annotated[dict, Depends(require_permission("voice"))],
+    voice_session_id: str | None = Form(None),
+    session_id: int | None = Form(None),
+):
+    """
+    Explicit Stop Assistant command.
+    Invalidates the active Nova voice session, cancels active generation,
+    and records audit event.
+    """
+    service = get_voice_service()
+    if voice_session_id:
+        service.stop_voice_session(voice_session_id)
+    if session_id is not None:
+        service.interrupt_session(session_id)
+
+    try:
+        from backend.services.audit import audit_log
+        audit_log(
+            action="VOICE_SESSION_STOPPED",
+            outcome="success",
+            user_id=user["id"],
+            username=user.get("username", "anonymous"),
+            target=f"voice_session:{voice_session_id or 'unknown'}",
+            details={"voice_session_id": voice_session_id, "session_id": session_id},
+        )
+    except Exception as exc:
+        logger.warning("Could not log voice session stop: %s", exc)
+
+    return {"status": "stopped", "voice_session_id": voice_session_id, "session_id": session_id}

@@ -487,5 +487,55 @@ class TestGraphEdgeStructure:
         assert ("respond", "__end__") in edge_pairs
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 14. Vision State Fields
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestVisionStateFields:
+    """Tests verifying AgentState includes vision tracking fields."""
+
+    def test_agent_state_has_vision_status(self):
+        """AgentState must have vision_status field."""
+        state = AgentState(query="test")
+        assert hasattr(state, "vision_status")
+        assert state.vision_status == ""
+
+    def test_agent_state_has_vision_error(self):
+        """AgentState must have vision_error field."""
+        state = AgentState(query="test")
+        assert hasattr(state, "vision_error")
+        assert state.vision_error == ""
+
+    def test_vision_status_serialization(self):
+        """vision_status and vision_error must appear in to_dict()."""
+        state = AgentState(
+            query="explain this diagram",
+            vision_status="VISION_ANALYSIS_FAILED",
+            vision_error="HTTP 500: prediction aborted, token repeat limit reached",
+        )
+        d = state.to_dict()
+        assert "vision_status" in d
+        assert d["vision_status"] == "VISION_ANALYSIS_FAILED"
+        assert "vision_error" in d
+        assert "token repeat limit" in d["vision_error"]
+
+    def test_vision_status_completed(self):
+        """vision_status=COMPLETED is valid."""
+        state = AgentState(query="analyze", vision_status="VISION_ANALYSIS_COMPLETED")
+        assert state.vision_status == "VISION_ANALYSIS_COMPLETED"
+        assert state.vision_error == ""
+
+    def test_vision_status_failed_with_error(self):
+        """Failed vision state preserves error for tracing."""
+        state = AgentState(
+            query="analyze",
+            vision_status="VISION_ANALYSIS_FAILED",
+            vision_error="Initial: HTTP 500; Retry: HTTP 500",
+        )
+        d = state.to_dict()
+        assert d["vision_status"] == "VISION_ANALYSIS_FAILED"
+        assert "Retry" in d["vision_error"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

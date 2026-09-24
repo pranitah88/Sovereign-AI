@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import VoiceOrb from './VoiceOrb';
 
 /**
@@ -12,6 +12,7 @@ import VoiceOrb from './VoiceOrb';
 export default function VoiceAssistantModal({
   isOpen,
   onClose,
+  onStopAssistant,
   voiceState,
   voiceLanguage,
   onLanguageChange,
@@ -26,19 +27,26 @@ export default function VoiceAssistantModal({
   analyser,
   activeSpokenText,
   activeClarificationPrompt,
+  vadDiagnostics,
+  micDiagnostics,
 }) {
   const canvasRef = useRef(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
-  // Close on Escape key
+  // Close / Stop on Escape key
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape' && isOpen) {
-        onClose();
+        if (onStopAssistant) {
+          onStopAssistant();
+        } else {
+          onClose();
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, onStopAssistant]);
 
   // Real-time audio waveform canvas rendering
   useEffect(() => {
@@ -164,21 +172,21 @@ export default function VoiceAssistantModal({
       case 'INITIALIZING':
       case 'STARTING':
         return {
-          title: 'Starting Voice Session...',
+          title: 'NOVA — Starting...',
           badgeClass: 'badge-init',
           description: 'Initializing sovereign conversational audio capture.',
           icon: '🎙️',
         };
       case 'GREETING':
         return {
-          title: 'Listening Soon...',
+          title: 'NOVA — Greeting...',
           badgeClass: 'badge-speaking',
-          description: activeSpokenText || 'Hi! What can I help you with?',
+          description: activeSpokenText || "Hi, I'm Nova. How can I help you today?",
           icon: '👋',
         };
       case 'LISTENING':
         return {
-          title: activeClarificationPrompt ? 'Listening for Your Answer...' : 'Listening...',
+          title: activeClarificationPrompt ? 'NOVA — Listening for Reply...' : 'NOVA — Listening...',
           badgeClass: 'badge-listening',
           description: activeClarificationPrompt
             ? `Answering: "${activeClarificationPrompt}"`
@@ -187,7 +195,7 @@ export default function VoiceAssistantModal({
         };
       case 'PROCESSING':
         return {
-          title: 'Processing Speech...',
+          title: 'NOVA — Processing...',
           badgeClass: 'badge-processing',
           description: 'Evaluating acoustic confidence and routing governance.',
           icon: '⚡',
@@ -195,52 +203,59 @@ export default function VoiceAssistantModal({
       case 'CLARIFYING':
       case 'ASKING_CLARIFICATION':
         return {
-          title: 'Asking Clarification...',
+          title: 'NOVA — Clarification Needed',
           badgeClass: 'badge-clarifying',
           description: activeClarificationPrompt || 'Assistant asking clarification question.',
           icon: '💬',
         };
       case 'SPEAKING_CLARIFICATION':
         return {
-          title: 'Speaking Clarification...',
+          title: 'NOVA — Speaking Clarification...',
           badgeClass: 'badge-speaking-clarification',
           description: activeClarificationPrompt || 'Assistant speaking clarification...',
           icon: '🗣️',
         };
       case 'WAITING_FOR_USER_REPLY':
         return {
-          title: 'Listening for Reply...',
+          title: 'NOVA — Listening for Reply...',
           badgeClass: 'badge-waiting-reply',
           description: activeClarificationPrompt ? `Clarifying: "${activeClarificationPrompt}"` : 'Listening for your spoken response...',
           icon: '👂',
         };
       case 'UNDERSTANDING':
         return {
-          title: 'Understanding Speech...',
+          title: 'NOVA — Understanding...',
           badgeClass: 'badge-understanding',
           description: 'Transcribing speech & checking security clearance.',
           icon: '⚙️',
         };
       case 'SEARCHING':
         return {
-          title: 'Searching Knowledge Base...',
+          title: 'NOVA — Searching...',
           badgeClass: 'badge-searching',
           description: 'Querying technical refinery documents & records.',
           icon: '🔍',
         };
       case 'THINKING':
         return {
-          title: 'Thinking...',
+          title: 'NOVA — Thinking...',
           badgeClass: 'badge-thinking',
           description: 'Streaming sovereign local Ollama reasoning.',
           icon: '🧠',
         };
       case 'SPEAKING':
         return {
-          title: 'Speaking Response...',
+          title: 'NOVA — Speaking...',
           badgeClass: 'badge-speaking',
           description: 'Playing synthesized natural response.',
           icon: '🔊',
+        };
+      case 'STOPPED':
+        return {
+          title: 'NOVA STOPPED',
+          badgeClass: 'badge-ready',
+          description: 'Assistant stopped. Click Nova to start again.',
+          icon: '⏹',
         };
       case 'ERROR':
         return {
@@ -251,9 +266,9 @@ export default function VoiceAssistantModal({
         };
       default:
         return {
-          title: 'Voice Assistant Ready',
+          title: 'NOVA — Ready',
           badgeClass: 'badge-ready',
-          description: 'Click microphone or speak to start.',
+          description: 'Click Nova or speak to start.',
           icon: '🎙️',
         };
     }
@@ -262,19 +277,29 @@ export default function VoiceAssistantModal({
   const meta = getStateMeta();
 
   return (
-    <div className="voice-modal-backdrop" onClick={onClose}>
+    <div className="voice-modal-backdrop" onClick={onStopAssistant || onClose}>
       <div className="voice-modal-card" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="voice-modal-header">
           <div className="voice-modal-brand">
             <span className="voice-brand-logo">MRPL</span>
             <div className="voice-brand-text">
-              <h4>Sovereign Voice Assistant</h4>
+              <h4>Nova Voice Assistant</h4>
               <span className="voice-offline-tag">100% On-Premise · Zero Cloud Egress</span>
             </div>
           </div>
 
           <div className="voice-modal-actions">
+            {/* Prominent Stop Assistant Button */}
+            <button
+              type="button"
+              className="btn-stop-assistant-header"
+              onClick={onStopAssistant || onClose}
+              title="Stop Nova Assistant and return to Idle"
+            >
+              ⏹ Stop Assistant
+            </button>
+
             {/* Language Selector */}
             <select
               className="voice-modal-lang-select"
@@ -292,7 +317,7 @@ export default function VoiceAssistantModal({
             <button
               type="button"
               className="voice-modal-close-btn"
-              onClick={onClose}
+              onClick={onStopAssistant || onClose}
               title="Close Voice Assistant (Esc)"
               aria-label="Close"
             >
@@ -389,6 +414,59 @@ export default function VoiceAssistantModal({
               </button>
             </div>
           )}
+
+          {/* Acoustic Diagnostics & Signal Quality Panel */}
+          <div className="voice-modal-diagnostics-section">
+            <button
+              type="button"
+              className="btn-toggle-diagnostics"
+              onClick={() => setShowDiagnostics((prev) => !prev)}
+              title="View real-time microphone preprocessing, ambient noise floor, and SNR"
+            >
+              <span className="diag-btn-title">📊 Acoustic Diagnostics</span>
+              <span className="diag-btn-arrow">{showDiagnostics ? '▲ Hide Metrics' : '▼ View Signal / Noise'}</span>
+            </button>
+            {showDiagnostics && (
+              <div className="voice-diagnostics-grid">
+                <div className="diag-card">
+                  <span className="diag-card-label">Noise Floor</span>
+                  <span className="diag-card-val">{(vadDiagnostics?.noise_floor_rms ?? 0.008).toFixed(4)} RMS</span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">Speech Level</span>
+                  <span className="diag-card-val">{(vadDiagnostics?.speech_rms ?? 0.0).toFixed(4)} RMS</span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">Est. SNR</span>
+                  <span className={`diag-card-val ${(vadDiagnostics?.snr_db ?? 0) >= 6 ? 'val-good' : 'val-warn'}`}>
+                    {(vadDiagnostics?.snr_db ?? 0.0).toFixed(1)} dB
+                  </span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">VAD Conf.</span>
+                  <span className="diag-card-val">{Math.round((vadDiagnostics?.vad_confidence ?? 0) * 100)}%</span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">VAD State</span>
+                  <span className={`diag-card-val ${vadDiagnostics?.speech_active ? 'val-active' : 'val-idle'}`}>
+                    {vadDiagnostics?.speech_active ? 'SPEECH' : 'SILENCE'}
+                  </span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">Echo Cancel</span>
+                  <span className="diag-card-val val-opt">{micDiagnostics?.echoCancellation ? 'Active' : 'Off'}</span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">Noise Suppr.</span>
+                  <span className="diag-card-val val-opt">{micDiagnostics?.noiseSuppression ? 'Active' : 'Off'}</span>
+                </div>
+                <div className="diag-card">
+                  <span className="diag-card-label">High-Pass Filter</span>
+                  <span className="diag-card-val val-opt">{micDiagnostics?.highpassCutoffHz || 80} Hz Cut</span>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Interactive Controls Footer */}
@@ -406,7 +484,7 @@ export default function VoiceAssistantModal({
               <button
                 type="button"
                 className="btn-voice-cancel"
-                onClick={onClose}
+                onClick={onStopAssistant || onClose}
               >
                 Cancel
               </button>
@@ -444,6 +522,18 @@ export default function VoiceAssistantModal({
               </button>
             </div>
           )}
+
+          {/* Prominent Stop Assistant Button */}
+          <div className="voice-footer-stop-row" style={{ display: 'flex', justifyContent: 'center', width: '100%', marginTop: '8px' }}>
+            <button
+              type="button"
+              className="btn-stop-assistant"
+              onClick={onStopAssistant || onClose}
+              title="Stop Nova Assistant immediately and return to Idle"
+            >
+              ⏹ Stop Assistant
+            </button>
+          </div>
 
           <div className="voice-footer-note">
             <span>● Hands-Free VAD Active: Automatically submits after 800ms silence</span>

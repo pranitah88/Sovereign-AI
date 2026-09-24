@@ -22,10 +22,16 @@ voice:
   # ── Voice Activity Detection (VAD) & Barge-In ──────────────────────────
   vad:
     enabled: true
-    silence_threshold_ms: 500        # Silence duration to trigger end-of-speech (reduced to 500ms)
+    adaptive: true
+    silence_threshold_ms: 750        # Silence duration to trigger end-of-speech (750ms)
     min_speech_duration_ms: 250      # Minimum audio duration to process
-    interruption_sensitivity: 0.025  # Amplitude threshold to detect barge-in during playback
-    energy_threshold: 0.02           # Speech vs silence energy threshold
+    interruption_sensitivity: 0.035  # Amplitude threshold to detect barge-in during playback
+    energy_threshold: 0.02           # Fallback energy threshold
+    min_energy_threshold: 0.012      # Minimum energy floor for speech in quiet environments
+    snr_start_threshold_db: 6.0      # Required SNR in dB to initiate speech detection
+    snr_stop_threshold_db: 3.0       # Required SNR in dB to maintain speech (hysteresis)
+    noise_floor_smoothing: 0.95      # Exponential smoothing factor for ambient noise tracking
+    highpass_cutoff_hz: 80.0         # High-pass filter cutoff to eliminate fan/AC/handling rumble
 
   # ── Language Detection ─────────────────────────────────────────────────
   language_detection:

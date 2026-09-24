@@ -45,8 +45,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize database.
     from backend.database.seed import seed_database
+    from backend.database.connection import get_db_path
     seed_database()
     logger.info("Database initialized and seeded.")
+    logger.info("ACTIVE AUTHORITATIVE DATABASE PATH: %s", get_db_path().resolve())
 
     # Log system event.
     try:

@@ -133,6 +133,22 @@ def node_classify(state: AgentState) -> AgentState:
 
     _add_trace_event(
         state,
+        "CURRENT_QUERY_RECEIVED",
+        f'Current Query Received: "{current_q}"',
+        "verified",
+        {"current_query": current_q, "turn_id": state.turn_id, "trace_id": state.trace_id},
+    )
+
+    _add_trace_event(
+        state,
+        "ATTACHMENT_CONTEXT_DETECTED",
+        f"Attachment context: has_scanned_pdf={state.has_scanned_pdf}, has_image={state.has_image}",
+        "verified",
+        {"has_scanned_pdf": state.has_scanned_pdf, "has_image": state.has_image},
+    )
+
+    _add_trace_event(
+        state,
         "ORCHESTRATOR_QUERY",
         f'Orchestrator Query: "{current_q}"',
         "verified",
@@ -168,6 +184,40 @@ def node_classify(state: AgentState) -> AgentState:
     state.model_endpoint = decision.get("endpoint", "http://127.0.0.1:11434/api/generate")
     state.required_tools = decision.get("tools", [])
     state.target_document = decision.get("target_document")
+    state.clarification_question = decision.get("clarification_question", "")
+    state.ambiguity_type = decision.get("ambiguity_type", "")
+
+    _add_trace_event(
+        state,
+        "TASK_INTENT_CLASSIFIED",
+        f"Task Intent: {state.task_type}",
+        "verified",
+        {"task_type": state.task_type, "model_id": state.model_id, "reason": state.classification_reasoning},
+    )
+
+    if state.task_type in ("CLARIFICATION", "INCOMPLETE_QUERY", "AMBIGUOUS_QUERY"):
+        _add_trace_event(
+            state,
+            "QUERY_COMPLETENESS_CHECK",
+            f'Query Completeness: Incomplete ({decision.get("reason", "")})',
+            "insufficient",
+            {"is_complete": False, "reason": decision.get("reason", "")},
+        )
+        if decision.get("ambiguity_type") in ("incomplete_ambiguous", "ambiguous_entity"):
+            _add_trace_event(
+                state,
+                "AMBIGUITY_DETECTED",
+                f'Ambiguity Detected: {decision.get("ambiguity_type")}',
+                "insufficient",
+                {"ambiguity_type": decision.get("ambiguity_type")},
+            )
+        _add_trace_event(
+            state,
+            "CLARIFICATION_REQUIRED",
+            f'Clarification Required: {state.clarification_question}',
+            "insufficient",
+            {"clarification_question": state.clarification_question, "task_type": state.task_type},
+        )
 
     _add_trace_event(
         state,
@@ -177,22 +227,76 @@ def node_classify(state: AgentState) -> AgentState:
         {"current_query": current_q, "task_type": state.task_type, "requires_rag": state.requires_rag},
     )
 
-    # If target_document was not in current query, search chat history
-    if not state.target_document and state.chat_history:
-        for msg in reversed(state.chat_history):
-            content = msg.get("content", "")
-            q_docs = re.findall(r'["\']([^"\']+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))["\']', content, re.IGNORECASE)
-            if q_docs:
-                state.target_document = q_docs[0].strip()
-                break
-            multi_m = re.search(r'([A-Za-z0-9_\-\s]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))', content, re.IGNORECASE)
-            if multi_m and len(multi_m.group(1).strip()) >= 4:
-                state.target_document = multi_m.group(1).strip()
-                break
-            docs = re.findall(r'[\w\-]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt)', content, re.IGNORECASE)
-            if docs:
-                state.target_document = docs[0]
-                break
+    # Document Analysis Gate & Context Resolution:
+    # Rule 4: Previous document state must not leak across turns!
+    # Independent queries MUST NEVER inherit previous turn's target_document or document state.
+    # ONLY search chat history for target_document IF:
+    # 1. The current task is DOCUMENT_ANALYSIS
+    # 2. AND state.target_document was not in current query
+    # 3. AND the current query is an explicit document follow-up (e.g. "explain the document", "explain the findings in more detail", "what does page 5 say")
+    if state.task_type == "DOCUMENT_ANALYSIS" and not state.target_document and state.chat_history:
+        current_lower = current_q.lower()
+        is_doc_followup = bool(re.search(
+            r'\b(the\s+document|the\s+pdf|the\s+report|this\s+document|this\s+pdf|the\s+findings|page\s+\d+|it|its)\b',
+            current_lower,
+        ))
+        if is_doc_followup:
+            for msg in reversed(state.chat_history):
+                if msg.get("target_document"):
+                    state.target_document = str(msg["target_document"]).strip()
+                    break
+                content = msg.get("content", "")
+                q_docs = re.findall(r'["\']([^"\']+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))["\']', content, re.IGNORECASE)
+                if q_docs:
+                    state.target_document = q_docs[0].strip()
+                    break
+                ticks = re.findall(r'`([^`]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))`', content, re.IGNORECASE)
+                if ticks:
+                    state.target_document = ticks[0].strip()
+                    break
+                docs = re.findall(r'\b([\w\-]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))\b', content, re.IGNORECASE)
+                if docs:
+                    state.target_document = docs[0].strip()
+                    break
+    elif state.task_type != "DOCUMENT_ANALYSIS":
+        # Hard turn isolation: non-document tasks MUST NOT have a target_document
+        state.target_document = None
+
+    # DOCUMENT_ANALYSIS_GATE trace event (Section 14)
+    if state.task_type == "DOCUMENT_ANALYSIS":
+        if state.target_document:
+            _add_trace_event(
+                state,
+                "DOCUMENT_ANALYSIS_GATE",
+                f"Document Analysis Gate: PASSED ({state.target_document})",
+                "allowed",
+                {"gate_status": "PASSED", "target_document": state.target_document},
+            )
+        else:
+            _add_trace_event(
+                state,
+                "DOCUMENT_ANALYSIS_GATE",
+                "Document Analysis Gate: PASSED (general document/OCR intent)",
+                "allowed",
+                {"gate_status": "PASSED", "target_document": None},
+            )
+    else:
+        _add_trace_event(
+            state,
+            "DOCUMENT_ANALYSIS_GATE",
+            f"Document Analysis Gate: NOT_REQUIRED (Task: {state.task_type})",
+            "verified",
+            {"gate_status": "NOT_REQUIRED", "task_type": state.task_type},
+        )
+
+    # TOOL_SELECTION trace event (Section 14)
+    _add_trace_event(
+        state,
+        "TOOL_SELECTION",
+        f"Tool Selection: {state.required_tools}",
+        "verified",
+        {"tools": state.required_tools},
+    )
 
     if state.target_document:
         try:
@@ -644,36 +748,77 @@ def node_tool_call(state: AgentState) -> AgentState:
                 resolve_document_file,
             )
 
-            target_doc = state.target_document
-            if not target_doc and state.chat_history:
-                for msg in reversed(state.chat_history):
-                    content = msg.get("content", "")
-                    q_docs = re.findall(r'["\']([^"\']+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))["\']', content, re.IGNORECASE)
-                    if q_docs:
-                        target_doc = q_docs[0].strip()
-                        break
-                    multi_m = re.search(r'([A-Za-z0-9_\-\s]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))', content, re.IGNORECASE)
-                    if multi_m and len(multi_m.group(1).strip()) >= 4:
-                        target_doc = multi_m.group(1).strip()
-                        break
-                    docs = re.findall(r'[\w\-]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt)', content, re.IGNORECASE)
-                    if docs:
-                        target_doc = docs[0]
-                        break
-            if not target_doc:
-                target_doc = "TranscriptSd.pdf"
+            # Tool Gate: Deliverable generation is strictly gated to DOCUMENT_ANALYSIS tasks (Section 6 & 12)
+            if state.task_type != "DOCUMENT_ANALYSIS":
+                logger.warning("Tool gate: rejected %s because task_type is %s", tool_name, state.task_type)
+                state.tool_results.append({
+                    "tool": tool_name,
+                    "status": "blocked",
+                    "error": f"Deliverable generation not permitted for task type {state.task_type}",
+                })
+                continue
 
-            try:
-                resolved_p, resolved_meta = resolve_document_file(target_doc)
-                if resolved_meta and resolved_meta.get("original_name"):
-                    target_doc = resolved_meta["original_name"]
-                elif resolved_p:
-                    target_doc = resolved_p.name
-            except Exception:
-                pass
+            target_doc = state.target_document
+            is_image_target = False
+            if not target_doc and state.chat_history:
+                current_lower = (state.current_query or state.query).lower()
+                is_doc_followup = bool(re.search(
+                    r'\b(the\s+document|the\s+pdf|the\s+report|this\s+document|this\s+pdf|the\s+findings|page\s+\d+|it|its)\b',
+                    current_lower,
+                ))
+                if is_doc_followup:
+                    for msg in reversed(state.chat_history):
+                        if msg.get("target_document"):
+                            target_doc = str(msg["target_document"]).strip()
+                            break
+                        content = msg.get("content", "")
+                        # Check for attached image marker first
+                        img_match = re.search(r'\[Attached Image:\s*([^\]]+)\]', content, re.IGNORECASE)
+                        if img_match:
+                            target_doc = img_match.group(1).strip()
+                            is_image_target = True
+                            break
+                        # Check for image file extensions
+                        img_docs = re.findall(r'[\w\-\s]+\.(?:png|jpg|jpeg|webp)', content, re.IGNORECASE)
+                        if img_docs:
+                            target_doc = img_docs[0].strip()
+                            is_image_target = True
+                            break
+                        # Check for regular documents
+                        q_docs = re.findall(r'["\']([^"\']+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))["\']', content, re.IGNORECASE)
+                        if q_docs:
+                            target_doc = q_docs[0].strip()
+                            break
+                        ticks = re.findall(r'`([^`]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))`', content, re.IGNORECASE)
+                        if ticks:
+                            target_doc = ticks[0].strip()
+                            break
+                        docs = re.findall(r'\b([\w\-]+\.(?:pdf|docx|doc|xlsx|xls|pptx|csv|txt))\b', content, re.IGNORECASE)
+                        if docs:
+                            target_doc = docs[0].strip()
+                            break
+
+            if not target_doc:
+                logger.warning("No target document available for deliverable generation; fail-closed without fallback")
+                state.tool_results.append({
+                    "tool": tool_name,
+                    "status": "error",
+                    "error": "No target document specified for deliverable generation.",
+                })
+                continue
+
+            if not is_image_target:
+                try:
+                    resolved_p, resolved_meta = resolve_document_file(target_doc)
+                    if resolved_meta and resolved_meta.get("original_name"):
+                        target_doc = resolved_meta["original_name"]
+                    elif resolved_p:
+                        target_doc = resolved_p.name
+                except Exception:
+                    pass
 
             state.target_document = target_doc
-            doc_model = extract_full_document(target_doc)
+            doc_model = extract_full_document(target_doc) if not is_image_target else None
 
             # 1. Preserve previous analysis if available in session history (Requirement 9)
             analysis_content = ""
@@ -696,7 +841,7 @@ def node_tool_call(state: AgentState) -> AgentState:
             # 2. If no previous analysis exists in history, synthesize it now
             if not analysis_content:
                 logger.info("No prior analysis found in session; running document analysis synthesis")
-                if not state.context:
+                if doc_model and not state.context:
                     state.context = build_document_analysis_context(doc_model)
                     state.sources = [
                         {"source": doc_model.document_name, "page": p.page_num}
@@ -710,18 +855,21 @@ def node_tool_call(state: AgentState) -> AgentState:
                 )
                 analysis_content = _call_llm(state, analysis_prompt, num_predict=1536)
 
-            # Always validate and sanitize analysis content before writing to document
-            analysis_content = validate_and_sanitize_analysis(analysis_content, doc_model)
+            # Validate and sanitize document analysis (skip for image targets)
+            if doc_model:
+                analysis_content = validate_and_sanitize_analysis(analysis_content, doc_model)
 
             # 3. Physically generate file
-            clean_name = re.sub(r'\.(pdf|docx|doc|xlsx|txt)$', '', target_doc, flags=re.IGNORECASE)
-            out_filename = f"{clean_name}_Analysis.{doc_type}"
+            clean_name = re.sub(r'\.(pdf|docx|doc|xlsx|txt|png|jpg|jpeg|webp)$', '', target_doc, flags=re.IGNORECASE)
+            import uuid
+            unique_token = uuid.uuid4().hex[:8]
+            out_filename = f"report_{unique_token}_{clean_name}.{doc_type}" if is_image_target else f"{clean_name}_Analysis.{doc_type}"
 
             try:
                 if doc_type == "pdf":
                     from backend.services.docgen import generate_pdf
                     file_res = generate_pdf(
-                        title="DOCUMENT ANALYSIS REPORT",
+                        title=f"ANALYSIS REPORT: {clean_name}" if is_image_target else "DOCUMENT ANALYSIS REPORT",
                         content=analysis_content,
                         document_name=target_doc,
                         filename=out_filename,
@@ -893,13 +1041,40 @@ def node_reason(state: AgentState) -> AgentState:
         _log_step(state)
         return state
 
+    # Fast path: Incomplete query / Ambiguous entity clarification (deterministic clarification without LLM)
+    if state.task_type in ("CLARIFICATION", "INCOMPLETE_QUERY", "AMBIGUOUS_QUERY"):
+        clarif_q = state.clarification_question or "Could you complete your question? Also, do you mean MRP or MRPL?"
+        _add_trace_event(
+            state,
+            "CLARIFICATION_REQUIRED",
+            f'Clarification Required ({state.task_type}): "{clarif_q}"',
+            "insufficient",
+            {"clarification_question": clarif_q, "ambiguity_type": getattr(state, "ambiguity_type", state.task_type)},
+        )
+        state.response = clarif_q
+        state.execution_ms = int((time.perf_counter() - start) * 1000)
+        state.current_step = "responded"
+        state.step_index += 1
+        _log_step(state)
+        return state
+
     # Fast path: General conversational chat / conceptual explanation (no RAG context needed)
     if state.task_type in ("GENERAL", "general_chat"):
+        # Response Type Integrity (Section 13)
+        state.deliverable = None
+        state.target_document = None
         prompt = GENERAL_CHAT_PROMPT.format(
             conversation_history=chat_history_str or "No previous conversation.",
             current_query=state.current_query,
         )
         state.response = _call_llm(state, prompt, num_predict=512)
+        _add_trace_event(
+            state,
+            "RESPONSE_GENERATION",
+            "General chat response generated",
+            "verified",
+            {"task_type": state.task_type, "deliverable": None},
+        )
         state.execution_ms = int((time.perf_counter() - start) * 1000)
         state.current_step = "responded"
         state.step_index += 1
@@ -907,9 +1082,10 @@ def node_reason(state: AgentState) -> AgentState:
         return state
 
     # Deliverable generation response (PDF or DOCX) — strictly reflects backend file status (Fail-Closed)
-    if any(t in ("docgen_pdf", "docgen_docx") or t.startswith("docgen_") for t in state.required_tools):
+    # Gated strictly to DOCUMENT_ANALYSIS task type with requested deliverable tools (Section 6 & 12)
+    if state.task_type == "DOCUMENT_ANALYSIS" and any(t in ("docgen_pdf", "docgen_docx") or t.startswith("docgen_") for t in state.required_tools):
         doc_type = "pdf" if "docgen_pdf" in state.required_tools else "docx"
-        target_doc = state.target_document or "TranscriptSd.pdf"
+        target_doc = state.target_document or "Document"
 
         if state.deliverable and state.deliverable.get("status") == "success":
             state.response = (
@@ -924,6 +1100,13 @@ def node_reason(state: AgentState) -> AgentState:
             )
             state.response = f"{doc_type.upper()} generation failed: {err}"
 
+        _add_trace_event(
+            state,
+            "RESPONSE_GENERATION",
+            f"Deliverable response generated for {state.deliverable.get('filename') if state.deliverable else 'FAILED'}",
+            "verified",
+            {"task_type": state.task_type, "deliverable": state.deliverable.get("filename") if state.deliverable else None},
+        )
         state.execution_ms = int((time.perf_counter() - start) * 1000)
         state.current_step = "responded"
         state.step_index += 1
@@ -932,7 +1115,22 @@ def node_reason(state: AgentState) -> AgentState:
 
     # Document analysis response (Turn 1: "analyze TranscriptSd.pdf")
     if state.task_type == "DOCUMENT_ANALYSIS":
-        target_doc = state.target_document or "TranscriptSd.pdf"
+        target_doc = state.target_document
+        if not target_doc:
+            state.response = "Please specify an uploaded document to analyze."
+            _add_trace_event(
+                state,
+                "RESPONSE_GENERATION",
+                "Document analysis response: missing target document",
+                "verified",
+                {"task_type": state.task_type, "target_document": None},
+            )
+            state.execution_ms = int((time.perf_counter() - start) * 1000)
+            state.current_step = "responded"
+            state.step_index += 1
+            _log_step(state)
+            return state
+
         from backend.services.doc_analysis import (
             extract_full_document,
             build_document_analysis_context,
@@ -954,6 +1152,13 @@ def node_reason(state: AgentState) -> AgentState:
         base_response = _call_llm(state, prompt, num_predict=1536)
         sanitized_response = validate_and_sanitize_analysis(base_response, doc_model)
         state.response = _normalize_citations_and_sources(sanitized_response, state.sources)
+        _add_trace_event(
+            state,
+            "RESPONSE_GENERATION",
+            f"Document analysis response generated for {target_doc}",
+            "verified",
+            {"task_type": state.task_type, "target_document": target_doc},
+        )
         state.execution_ms = int((time.perf_counter() - start) * 1000)
         state.current_step = "responded"
         state.step_index += 1
@@ -1195,6 +1400,29 @@ def node_reason(state: AgentState) -> AgentState:
                         state.response = "I couldn't find sufficient information in the local knowledge base for this specific refinery unit."
     except Exception as ug_err:
         logger.warning("Error during unit grounding check in node_reason: %s", ug_err)
+
+    # Response Type Integrity (Section 13)
+    # Validate requested_task_type, actual_executed_task_type, generated_artifacts
+    if state.task_type in ("GENERAL", "RAG", "CODING", "CLARIFICATION", "INCOMPLETE_QUERY"):
+        if state.deliverable is not None:
+            logger.warning("Response Type Integrity: clearing stale deliverable artifact for task_type=%s", state.task_type)
+            state.deliverable = None
+        if state.target_document is not None:
+            logger.warning("Response Type Integrity: clearing stale target_document for task_type=%s", state.task_type)
+            state.target_document = None
+
+    _add_trace_event(
+        state,
+        "RESPONSE_GENERATION",
+        f"Response generated for {state.task_type}",
+        "verified",
+        {
+            "task_type": state.task_type,
+            "has_deliverable": bool(state.deliverable),
+            "deliverable_file": state.deliverable.get("filename") if state.deliverable else None,
+            "target_document": state.target_document,
+        },
+    )
 
     state.execution_ms = int((time.perf_counter() - start) * 1000)
 
@@ -1522,6 +1750,26 @@ def node_validate(state: AgentState) -> AgentState:
 
 def node_respond(state: AgentState) -> AgentState:
     """Finalize and persist the response with output trace and audit log."""
+    # Response Type Integrity (Section 13):
+    # Non-document tasks MUST NOT have deliverable artifacts or target documents
+    if state.task_type in ("GENERAL", "RAG", "CODING", "CLARIFICATION", "INCOMPLETE_QUERY"):
+        state.deliverable = None
+        state.target_document = None
+
+    if not any(e.get("event") == "RESPONSE_GENERATION" for e in (state.execution_trace or [])):
+        _add_trace_event(
+            state,
+            "RESPONSE_GENERATION",
+            f"Response generated for {state.task_type}",
+            "verified",
+            {
+                "task_type": state.task_type,
+                "has_deliverable": bool(state.deliverable),
+                "deliverable_file": state.deliverable.get("filename") if state.deliverable else None,
+                "target_document": state.target_document,
+            },
+        )
+
     _add_trace_event(
         state,
         "output_generated",
@@ -1935,6 +2183,9 @@ async def run_agent(
             }
             for m in messages[-20:]  # Last 20 messages for context
         ]
+        state.turn_id = len(state.chat_history) // 2 + 1
+    else:
+        state.turn_id = 1
 
     # Create a task record.
     with transaction() as conn:

@@ -86,25 +86,34 @@ class VoiceService:
         vad_cfg = self.config.get("voice", {}).get("vad", {})
         self.vad = VoiceActivityDetector(
             energy_threshold=vad_cfg.get("energy_threshold", 0.02),
-            silence_threshold_ms=vad_cfg.get("silence_threshold_ms", 800),
+            silence_threshold_ms=vad_cfg.get("silence_threshold_ms", 750),
             min_speech_duration_ms=vad_cfg.get("min_speech_duration_ms", 250),
             sample_rate=self.config.get("voice", {}).get("audio_sample_rate", 16000),
+            adaptive=vad_cfg.get("adaptive", True),
+            min_energy_threshold=vad_cfg.get("min_energy_threshold", 0.012),
+            snr_start_threshold_db=vad_cfg.get("snr_start_threshold_db", 6.0),
+            snr_stop_threshold_db=vad_cfg.get("snr_stop_threshold_db", 3.0),
+            noise_floor_smoothing=vad_cfg.get("noise_floor_smoothing", 0.95),
+            highpass_cutoff_hz=vad_cfg.get("highpass_cutoff_hz", 80.0),
         )
 
         # Active session interruption tracking for barge-in
         self._interrupted_sessions: set[int] = set()
+        self._interrupted_turns: set[int] = set()
         # Active turn tracking per session to prevent race conditions from outdated turns
         self._active_session_turns: dict[int, int] = {}
+        # Explicitly stopped Nova voice sessions to guarantee stopped sessions cannot affect new sessions
+        self._stopped_voice_sessions: set[str] = set()
 
     def get_greeting(self, language: str = "en") -> dict[str, Any]:
-        """Return a natural greeting text and local synthesized audio."""
+        """Return deterministic Nova greeting text and local synthesized audio."""
         lang = (language or "en").lower()
         if lang == "hi":
-            text = "नमस्ते! मैं आपकी क्या सहायता कर सकता हूँ?"
+            text = "नमस्ते! मैं नोवा हूँ। मैं आपकी क्या सहायता कर सकता हूँ?"
         elif lang == "mr":
-            text = "नमस्कार! मी तुम्हाला काय मदत करू शकतो?"
+            text = "नमस्कार! मी नोव्हा आहे. मी तुम्हाला काय मदत करू शकतो?"
         else:
-            text = "Hi! What can I help you with?"
+            text = "Hi, I'm Nova. How can I help you today?"
 
         audio_b64 = ""
         duration = 1.0
@@ -117,6 +126,7 @@ class VoiceService:
             logger.warning("Greeting synthesis notice: %s", exc)
 
         return {
+            "status": "success",
             "text": text,
             "spoken_text": text,
             "audio_base64": audio_b64,
@@ -200,6 +210,33 @@ class VoiceService:
             return False
         return session_id in self._interrupted_sessions
 
+    def interrupt_turn(self, turn_id: int | None) -> None:
+        """Mark specific turn as interrupted by user barge-in."""
+        if turn_id is not None:
+            self._interrupted_turns.add(turn_id)
+
+    def is_turn_interrupted(self, turn_id: int | None) -> bool:
+        """Check whether turn has been interrupted by user barge-in."""
+        if turn_id is None:
+            return False
+        return turn_id in self._interrupted_turns
+
+    def stop_voice_session(self, voice_session_id: str | None) -> None:
+        """Explicitly stop and invalidate a Nova voice session."""
+        if voice_session_id:
+            self._stopped_voice_sessions.add(str(voice_session_id))
+
+    def is_voice_session_stopped(self, voice_session_id: str | None) -> bool:
+        """Check whether a Nova voice session has been explicitly stopped."""
+        if not voice_session_id:
+            return False
+        return str(voice_session_id) in self._stopped_voice_sessions
+
+    def register_voice_session(self, voice_session_id: str | None) -> None:
+        """Register a new active Nova voice session (clears any prior stopped flag)."""
+        if voice_session_id:
+            self._stopped_voice_sessions.discard(str(voice_session_id))
+
     def _load_config(self) -> dict[str, Any]:
         """Load voice configuration from YAML file."""
         if self.config_path.exists():
@@ -256,6 +293,9 @@ class VoiceService:
 
         return {
             "text": asr_result.get("text", ""),
+            "raw_text": asr_result.get("raw_text", asr_result.get("text", "")),
+            "normalized_text": asr_result.get("normalized_text", asr_result.get("text", "")),
+            "is_normalized": asr_result.get("is_normalized", False),
             "confidence": asr_result.get("confidence", 0.0),
             "status": asr_result.get("status", "error"),
             "language": detected_lang_info,
@@ -271,7 +311,9 @@ class VoiceService:
         session_id: int | None = None,
         language_hint: str | None = None,
         confirmed_query: str | None = None,
-        clarification_context: dict | str | None = None,
+        clarification_context: dict[str, Any] | str | None = None,
+        voice_mode: str = "NOVA",
+        voice_session_id: str | None = None,
     ) -> dict[str, Any]:
         """
         End-to-end voice query processing:
@@ -291,13 +333,53 @@ class VoiceService:
                 "details": details or {},
             })
 
-        # ── Step 1: VOICE INPUT RECEIVED ──────────────────────────────────────
+        # ── Step 1: VOICE INPUT RECEIVED & VAD DIAGNOSTICS ──────────────────
         audio_bytes_len = len(audio_data) if isinstance(audio_data, bytes) else 0
         _log_trace(
             "voice_input_received",
             f"Voice audio payload received ({audio_bytes_len / 1024:.1f} KB)",
             "allowed",
             {"size_bytes": audio_bytes_len, "language_hint": language_hint or "auto"},
+        )
+        _log_trace("VOICE_CAPTURE_STARTED", "Voice audio capture initiated", "allowed", {"language_hint": language_hint or "auto", "session_id": session_id})
+
+        # Real VAD & audio diagnostics
+        vad_metrics = {}
+        if isinstance(audio_data, bytes) and len(audio_data) > 0:
+            try:
+                vad_metrics = self.vad.detect_speech_boundaries(audio_data)
+            except Exception:
+                vad_metrics = self.vad.get_diagnostics()
+        else:
+            vad_metrics = self.vad.get_diagnostics()
+
+        capture_dur_val = vad_metrics.get("capture_duration_ms", 0)
+        speech_dur_val = vad_metrics.get("speech_duration_ms", 0)
+        sample_rate_val = vad_metrics.get("sample_rate", getattr(self.vad, "sample_rate", 16000))
+        channel_count_val = vad_metrics.get("channel_count", 1)
+        input_rms_val = vad_metrics.get("input_rms", 0.0)
+        peak_val = vad_metrics.get("peak", 0.0)
+        noise_floor_val = vad_metrics.get("noise_floor_rms", 0.008)
+        speech_rms_val = vad_metrics.get("speech_rms", 0.0)
+        snr_db_val = vad_metrics.get("snr_db", 0.0)
+        vad_conf_val = vad_metrics.get("vad_confidence", 0.0)
+        speech_active_val = vad_metrics.get("has_speech", True)
+
+        _log_trace("AUDIO_NOISE_FLOOR", f"Ambient noise floor: {noise_floor_val:.4f} RMS", "verified", {"noise_floor_rms": noise_floor_val})
+        _log_trace("AUDIO_RMS", f"Audio RMS level: {speech_rms_val:.4f}", "verified", {"speech_rms": speech_rms_val, "input_rms": input_rms_val, "peak": peak_val})
+        _log_trace("AUDIO_SNR", f"Audio SNR: {snr_db_val:.1f} dB", "verified", {"snr_db": snr_db_val})
+        _log_trace(
+            "VAD_STATE_CHANGED",
+            f"VAD State: {'SPEECH' if speech_active_val else 'SILENCE'} (duration: {speech_dur_val}ms, confidence: {vad_conf_val:.2f})",
+            "verified",
+            {
+                "speech_active": speech_active_val,
+                "confidence": vad_conf_val,
+                "capture_duration_ms": capture_dur_val,
+                "speech_duration_ms": speech_dur_val,
+                "sample_rate": sample_rate_val,
+                "channel_count": channel_count_val,
+            },
         )
 
         # ── Step 2: SPEECH RECOGNITION (ASR) ─────────────────────────────────
@@ -340,6 +422,54 @@ class VoiceService:
         _log_trace("ASR_NORMALIZED", norm_desc, "verified", {"raw_text": raw_text, "normalized_text": transcribed_text, "is_normalized": is_normalized})
         _log_trace("CHAT_REQUEST_QUERY", f'Chat Request Query: "{transcribed_text}"', "verified", {"current_query": transcribed_text, "trace_id": trace_id})
         _log_trace("ORCHESTRATOR_QUERY", f'Orchestrator Query: "{transcribed_text}"', "verified", {"current_query": transcribed_text, "trace_id": trace_id})
+
+        # In normal Voice-to-Text / Dictation mode, return immediately without calling LLM, RAG, or TTS
+        if voice_mode in ("VOICE_TO_TEXT", "DICTATION"):
+            threshold = getattr(self.asr, "confidence_threshold", 0.55)
+            if asr_status == "low_confidence" or asr_confidence < threshold:
+                low_conf_reason = (
+                    asr_res.get("low_confidence_reason")
+                    or asr_res.get("quality", {}).get("reason")
+                    or (f"Token acoustic confidence too low: {asr_confidence:.2f} < {threshold:.2f}" if asr_confidence < threshold else "low_confidence")
+                )
+                diag_payload = {
+                    **vad_metrics,
+                    "asr_confidence": asr_confidence,
+                    "confidence_threshold": threshold,
+                    "asr_status": asr_status,
+                    "low_confidence_reason": low_conf_reason,
+                    "raw_text": raw_text,
+                }
+                _log_trace(
+                    "ASR_LOW_CONFIDENCE",
+                    f"ASR Low Confidence: {asr_confidence:.2f} < {threshold} ({low_conf_reason})",
+                    "insufficient",
+                    diag_payload,
+                )
+                return {
+                    "status": "low_confidence",
+                    "message": "Couldn't confidently transcribe that. Please try again.",
+                    "low_confidence_reason": low_conf_reason,
+                    "diagnostics": diag_payload,
+                    "raw_text": raw_text,
+                    "normalized_text": transcribed_text,
+                    "confidence": asr_confidence,
+                    "voice_mode": voice_mode,
+                    "voice_session_id": voice_session_id,
+                    "trace_id": trace_id,
+                    "execution_trace": voice_trace,
+                }
+            _log_trace("VOICE_TO_TEXT_COMPLETED", f'Voice-to-Text completed: "{transcribed_text}"', "verified", {"raw_text": raw_text, "normalized_text": transcribed_text, "confidence": asr_confidence})
+            return {
+                "status": "success",
+                "raw_text": raw_text,
+                "normalized_text": transcribed_text,
+                "confidence": asr_confidence,
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
+                "trace_id": trace_id,
+                "execution_trace": voice_trace,
+            }
 
         _log_trace(
             "speech_recognition",
@@ -384,25 +514,110 @@ class VoiceService:
                 "trace_id": trace_id,
             }
 
-        # Check clarification context if user is answering a previous question
-        if isinstance(clarification_context, str) and clarification_context.strip():
-            try:
-                clarification_context = json.loads(clarification_context)
-            except Exception:
-                clarification_context = None
+        # ── Step 3.5: CONVERSATIONAL INTENT DETECTION ─────────────────────
+        # Intercept simple greetings / farewells / casual exchanges locally.
+        # Bypass RAG, Ollama, and the full governed pipeline for these.
+        from backend.services.voice.conversational_intent import detect_conversational_intent
+        conv_intent = detect_conversational_intent(transcribed_text)
 
-        if clarification_context:
+        if conv_intent.is_conversational and conv_intent.response_text:
+            _log_trace(
+                "CONVERSATION_INTENT_DETECTED",
+                f"Conversational intent: {conv_intent.intent.value}",
+                "allowed",
+                conv_intent.to_dict(),
+            )
+            _log_trace(
+                "LOCAL_CONVERSATIONAL_RESPONSE",
+                f"Route: LOCAL_CONVERSATIONAL_RESPONSE",
+                "allowed",
+                {"response": conv_intent.response_text, "pool_key": conv_intent.response_key},
+            )
+
+            spoken_text = conv_intent.response_text
+            _log_trace("TTS_STARTED", "Text-to-speech synthesis initiated", "allowed")
+            tts_result = self.tts.synthesize(spoken_text, language=lang_info["code"])
+            audio_bytes = tts_result.get("audio_bytes", b"") if isinstance(tts_result, dict) else b""
+            audio_base64 = (
+                base64.b64encode(audio_bytes).decode("utf-8")
+                if isinstance(audio_bytes, (bytes, bytearray)) and len(audio_bytes) > 0
+                else None
+            )
+            tts_duration = tts_result.get("duration_seconds", 0.0) if isinstance(tts_result, dict) else 0.0
+            _log_trace("TTS_COMPLETED", f"Speech synthesis completed ({tts_duration:.1f}s)", "verified", {"duration_seconds": tts_duration})
+            _log_trace("VOICE_CAPTURE_RESUMED", "Continuous conversational voice capture resumed", "allowed")
+
+            try:
+                audit_log(
+                    action="voice_interaction",
+                    outcome="success",
+                    user_id=user["id"],
+                    username=user.get("username", "anonymous"),
+                    target=f"session:{session_id or 'direct'}",
+                    details={
+                        "trace_id": trace_id,
+                        "input_mode": "voice",
+                        "language": lang_info["code"],
+                        "asr_confidence": asr_confidence,
+                        "conversational_intent": conv_intent.intent.value,
+                        "route": "LOCAL_CONVERSATIONAL_RESPONSE",
+                    },
+                )
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "transcribed_text": transcribed_text,
+                "raw_text": raw_text,
+                "normalized_text": transcribed_text,
+                "is_normalized": is_normalized,
+                "response": spoken_text,
+                "spoken_text": spoken_text,
+                "language": lang_info,
+                "asr_confidence": asr_confidence,
+                "audio_base64": audio_base64,
+                "audio_content_type": tts_result.get("content_type", "audio/wav") if isinstance(tts_result, dict) else "audio/wav",
+                "audio_duration": tts_duration,
+                "execution_trace": voice_trace,
+                "trace_id": trace_id,
+                "task_type": "CONVERSATIONAL",
+                "model_id": "local_conversational",
+                "scope_decision": {},
+                "confidence_decision": None,
+                "citation_validation": None,
+                "requires_human_review": False,
+                "approval_id": None,
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
+                "conversational_intent": conv_intent.intent.value,
+            }
+
+        # Check clarification context if user is answering a previous question
+        clarif_dict: dict[str, Any] | None = None
+        if isinstance(clarification_context, str):
+            if clarification_context.strip():
+                try:
+                    loaded = json.loads(clarification_context)
+                    if isinstance(loaded, dict):
+                        clarif_dict = loaded
+                except Exception:
+                    clarif_dict = None
+        elif isinstance(clarification_context, dict):
+            clarif_dict = clarification_context
+
+        if clarif_dict:
             from backend.services.voice.clarification import resolve_clarification_response
             resolved_text = resolve_clarification_response(
                 transcribed_text,
-                clarification_context,
+                clarif_dict,
                 language=lang_info.get("code", "en"),
             )
             _log_trace(
                 "clarification_resolved",
                 f'Clarification answer merged: "{resolved_text}"',
                 "verified",
-                {"original": clarification_context.get("original_query"), "answer": transcribed_text, "resolved": resolved_text},
+                {"original": clarif_dict.get("original_query"), "answer": transcribed_text, "resolved": resolved_text},
             )
             transcribed_text = resolved_text
         elif not confirmed_query:
@@ -447,6 +662,8 @@ class VoiceService:
                     "clarification_text": ambiguity.clarification_question,
                     "audio_base64": clarification_audio,
                     "context": ambiguity.to_dict(),
+                    "voice_mode": voice_mode,
+                    "voice_session_id": voice_session_id,
                     "execution_trace": voice_trace,
                     "trace_id": trace_id,
                 }
@@ -504,6 +721,7 @@ class VoiceService:
             spoken_text = "This engineering inquiry has been routed to the supervisor queue for human review."
 
         # ── Step 6: TEXT-TO-SPEECH (TTS) ──────────────────────────────────────
+        _log_trace("TTS_STARTED", "Text-to-speech synthesis initiated", "allowed")
         tts_result = self.tts.synthesize(spoken_text, language=lang_info["code"])
         audio_bytes = tts_result.get("audio_bytes", b"") if isinstance(tts_result, dict) else b""
         audio_base64 = (
@@ -515,6 +733,10 @@ class VoiceService:
         tts_engine_name = tts_result.get("engine", "Local TTS") if isinstance(tts_result, dict) else "Local TTS"
         tts_status = tts_result.get("status", "unknown") if isinstance(tts_result, dict) else "unknown"
         tts_duration = tts_result.get("duration_seconds", 0.0) if isinstance(tts_result, dict) else 0.0
+
+        _log_trace("TTS_COMPLETED", f"Speech synthesis completed ({tts_duration:.1f}s)", "verified", {"duration_seconds": tts_duration, "engine": tts_engine_name})
+        _log_trace("VOICE_CAPTURE_RESUMED", "Continuous conversational voice capture resumed", "allowed")
+        _log_trace("VOICE_SESSION_ENDED", "Voice interaction completed", "verified", {"trace_id": trace_id, "duration_seconds": tts_duration})
 
         combined_trace.append({
             "event": "tts_synthesized",
@@ -581,6 +803,8 @@ class VoiceService:
             "citation_validation": agent_result.get("citation_validation"),
             "requires_human_review": agent_result.get("requires_human_review", False),
             "approval_id": agent_result.get("approval_id"),
+            "voice_mode": voice_mode,
+            "voice_session_id": voice_session_id,
         }
 
     def _stream_ollama_tokens(self, endpoint: str, payload: dict) -> Any:
@@ -642,8 +866,10 @@ class VoiceService:
         session_id: int | None = None,
         language_hint: str | None = None,
         confirmed_query: str | None = None,
-        clarification_context: dict | str | None = None,
+        clarification_context: dict[str, Any] | str | None = None,
         turn_id: int | None = None,
+        voice_mode: str = "NOVA",
+        voice_session_id: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Real-Time Conversational Streaming Voice Pipeline:
@@ -656,12 +882,18 @@ class VoiceService:
         trace_id = f"TRC-VCE-{uuid.uuid4().hex[:8].upper()}"
         voice_trace = []
 
+        if self.is_voice_session_stopped(voice_session_id):
+            logger.info("Nova session %s has been explicitly stopped. Ignoring request.", voice_session_id)
+            return
+
         if session_id is not None:
             self.clear_interruption(session_id)
             if turn_id is not None:
                 self._active_session_turns[session_id] = turn_id
 
         def _is_stale_turn() -> bool:
+            if self.is_voice_session_stopped(voice_session_id):
+                return True
             if session_id is not None and turn_id is not None:
                 active = self._active_session_turns.get(session_id)
                 if active is not None and active != turn_id:
@@ -672,6 +904,9 @@ class VoiceService:
             d = dict(details or {})
             if turn_id is not None:
                 d["turn_id"] = turn_id
+            if voice_session_id is not None:
+                d["voice_session_id"] = voice_session_id
+            d["voice_mode"] = voice_mode
             voice_trace.append({
                 "event": event,
                 "title": title,
@@ -681,8 +916,82 @@ class VoiceService:
             })
 
         # ── 1. Request Received & Session Started ─────────────────────────────
-        _log_trace("VOICE_SESSION_STARTED", "Voice audio stream initiated", "allowed", {"language_hint": language_hint or "auto", "session_id": session_id, "turn_id": turn_id})
-        yield {"event": "asr_started", "timestamp": datetime.now(timezone.utc).isoformat(), "trace_id": trace_id, "turn_id": turn_id}
+        if voice_mode in ("VOICE_TO_TEXT", "DICTATION"):
+            _log_trace("VOICE_TO_TEXT_STARTED", "Voice-to-Text audio capture initiated", "allowed", {"language_hint": language_hint or "auto", "voice_session_id": voice_session_id, "turn_id": turn_id})
+            yield {
+                "event": "voice_to_text_started",
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
+                "turn_id": turn_id,
+                "trace_id": trace_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            _log_trace("VOICE_CAPTURE_STARTED", "Voice audio stream capture initiated", "allowed", {"language_hint": language_hint or "auto", "session_id": session_id, "voice_session_id": voice_session_id, "turn_id": turn_id})
+            _log_trace("VOICE_SESSION_STARTED", "Voice audio stream initiated", "allowed", {"language_hint": language_hint or "auto", "session_id": session_id, "voice_session_id": voice_session_id, "turn_id": turn_id})
+            yield {
+                "event": "asr_started",
+                "voice_mode": "NOVA",
+                "voice_session_id": voice_session_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "trace_id": trace_id,
+                "turn_id": turn_id,
+            }
+
+        # Real VAD & audio diagnostics
+        vad_metrics = {}
+        if isinstance(audio_data, bytes) and len(audio_data) > 0:
+            try:
+                vad_metrics = self.vad.detect_speech_boundaries(audio_data)
+            except Exception:
+                vad_metrics = self.vad.get_diagnostics()
+        else:
+            vad_metrics = self.vad.get_diagnostics()
+
+        capture_dur_val = vad_metrics.get("capture_duration_ms", 0)
+        speech_dur_val = vad_metrics.get("speech_duration_ms", 0)
+        sample_rate_val = vad_metrics.get("sample_rate", getattr(self.vad, "sample_rate", 16000))
+        channel_count_val = vad_metrics.get("channel_count", 1)
+        input_rms_val = vad_metrics.get("input_rms", 0.0)
+        peak_val = vad_metrics.get("peak", 0.0)
+        noise_floor_val = vad_metrics.get("noise_floor_rms", 0.008)
+        speech_rms_val = vad_metrics.get("speech_rms", 0.0)
+        snr_db_val = vad_metrics.get("snr_db", 0.0)
+        vad_conf_val = vad_metrics.get("vad_confidence", 0.0)
+        speech_active_val = vad_metrics.get("has_speech", True)
+
+        _log_trace("AUDIO_NOISE_FLOOR", f"Ambient noise floor: {noise_floor_val:.4f} RMS", "verified", {"noise_floor_rms": noise_floor_val})
+        _log_trace("AUDIO_RMS", f"Audio RMS level: {speech_rms_val:.4f}", "verified", {"speech_rms": speech_rms_val, "input_rms": input_rms_val, "peak": peak_val})
+        _log_trace("AUDIO_SNR", f"Audio SNR: {snr_db_val:.1f} dB", "verified", {"snr_db": snr_db_val})
+        _log_trace(
+            "VAD_STATE_CHANGED",
+            f"VAD State: {'SPEECH' if speech_active_val else 'SILENCE'} (duration: {speech_dur_val}ms, confidence: {vad_conf_val:.2f})",
+            "verified",
+            {
+                "speech_active": speech_active_val,
+                "confidence": vad_conf_val,
+                "capture_duration_ms": capture_dur_val,
+                "speech_duration_ms": speech_dur_val,
+                "sample_rate": sample_rate_val,
+                "channel_count": channel_count_val,
+            },
+        )
+
+        yield {
+            "event": "audio_diagnostics",
+            "capture_duration_ms": capture_dur_val,
+            "speech_duration_ms": speech_dur_val,
+            "sample_rate": sample_rate_val,
+            "channel_count": channel_count_val,
+            "input_rms": input_rms_val,
+            "peak": peak_val,
+            "noise_floor_rms": noise_floor_val,
+            "speech_rms": speech_rms_val,
+            "snr_db": snr_db_val,
+            "vad_confidence": vad_conf_val,
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+        }
 
         # ── 2. Speech Recognition (ASR) ───────────────────────────────────────
         t_asr_start = time.perf_counter()
@@ -695,6 +1004,7 @@ class VoiceService:
             raw_lang = language_hint or "en"
             t_asr_final = time.perf_counter()
             asr_latency_ms = 0.0
+            asr_res = {}
         else:
             asr_res = await asyncio.to_thread(self.asr.transcribe, audio_data, language=language_hint)
             t_asr_final = time.perf_counter()
@@ -791,33 +1101,203 @@ class VoiceService:
             yield {
                 "event": "empty",
                 "message": "No audible speech detected. Please speak clearly into the microphone.",
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
                 "trace_id": trace_id,
+                "turn_id": turn_id,
+            }
+            return
+
+        # ── 2.5: CONVERSATIONAL INTENT DETECTION ──────────────────────────────
+        # Intercept simple greetings / farewells / casual exchanges locally.
+        # Bypass Scope Guard, RAG, Ollama, and the full governed pipeline for these.
+        from backend.services.voice.conversational_intent import detect_conversational_intent
+        conv_intent = detect_conversational_intent(transcribed_text)
+
+        if conv_intent.is_conversational and conv_intent.response_text:
+            _log_trace(
+                "CONVERSATION_INTENT_DETECTED",
+                f"Conversational intent: {conv_intent.intent.value}",
+                "allowed",
+                conv_intent.to_dict(),
+            )
+            _log_trace(
+                "LOCAL_CONVERSATIONAL_RESPONSE",
+                f"Route: LOCAL_CONVERSATIONAL_RESPONSE",
+                "allowed",
+                {"response": conv_intent.response_text, "pool_key": conv_intent.response_key},
+            )
+
+            yield {
+                "event": "conversational_intent_detected",
+                "intent": conv_intent.intent.value,
+                "response_key": conv_intent.response_key,
+                "trace_id": trace_id,
+                "turn_id": turn_id,
+            }
+
+            spoken_text = conv_intent.response_text
+            _log_trace("TTS_STARTED", "Text-to-speech synthesis initiated", "allowed")
+            tts_res = await asyncio.to_thread(self.tts.synthesize, spoken_text, language=lang_info["code"])
+            audio_bytes = tts_res.get("audio_bytes", b"")
+            tts_duration = tts_res.get("duration_seconds", 0.0)
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8") if isinstance(audio_bytes, (bytes, bytearray)) and audio_bytes else None
+
+            _log_trace("TTS_COMPLETED", f"Speech synthesis completed ({tts_duration:.1f}s)", "verified", {"duration_seconds": tts_duration})
+
+            yield {
+                "event": "tts_chunk",
+                "chunk_index": 0,
+                "spoken_text": spoken_text,
+                "audio_base64": audio_b64,
+                "duration_seconds": tts_duration,
+                "is_final": True,
+                "turn_id": turn_id,
+            }
+
+            # Store in session
+            if session_id:
+                try:
+                    chat_repo.add_message(session_id, "user", f"🎤 [{lang_info['name']}] {transcribed_text}")
+                    chat_repo.add_message(session_id, "assistant", spoken_text)
+                except Exception as store_err:
+                    logger.warning("Could not persist conversational message to session: %s", store_err)
+
+            # Audit log
+            try:
+                audit_log(
+                    action="voice_interaction",
+                    outcome="success",
+                    user_id=user["id"],
+                    username=user.get("username", "anonymous"),
+                    target=f"session:{session_id or 'direct'}",
+                    details={
+                        "trace_id": trace_id,
+                        "input_mode": "voice_stream",
+                        "language": lang_info["code"],
+                        "asr_confidence": asr_confidence,
+                        "conversational_intent": conv_intent.intent.value,
+                        "route": "LOCAL_CONVERSATIONAL_RESPONSE",
+                    },
+                )
+            except Exception:
+                pass
+
+            _log_trace("VOICE_CAPTURE_RESUMED", "Continuous conversational voice capture resumed", "allowed")
+            _log_trace("LISTENING_RESUMED", "Continuous conversational turn ready", "allowed")
+
+            yield {
+                "event": "complete",
+                "response": spoken_text,
+                "spoken_text": spoken_text,
+                "trace": voice_trace,
+                "trace_id": trace_id,
+                "task_type": "CONVERSATIONAL",
+                "model_id": "local_conversational",
+                "requires_human_review": False,
+                "approval_id": None,
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
+                "turn_id": turn_id,
+                "conversational_intent": conv_intent.intent.value,
+            }
+
+            if voice_mode == "NOVA" and not self.is_interrupted(session_id) and not self.is_voice_session_stopped(voice_session_id):
+                yield {
+                    "event": "listening",
+                    "voice_mode": "NOVA",
+                    "voice_session_id": voice_session_id,
+                    "turn_id": turn_id,
+                    "trace_id": trace_id,
+                }
+            return
+
+        # In normal Voice-to-Text / Dictation mode: return transcript for text composer without calling LLM/RAG/TTS
+        if voice_mode in ("VOICE_TO_TEXT", "DICTATION"):
+            threshold = getattr(self.asr, "confidence_threshold", 0.55)
+            if asr_status == "error" or asr_status == "low_confidence" or asr_confidence < threshold:
+                low_conf_reason = (
+                    asr_res.get("low_confidence_reason")
+                    or asr_res.get("quality", {}).get("reason")
+                    or (f"Token acoustic confidence too low: {asr_confidence:.2f} < {threshold:.2f}" if asr_confidence < threshold else "low_confidence")
+                )
+                diag_payload = {
+                    **vad_metrics,
+                    "asr_confidence": asr_confidence,
+                    "confidence_threshold": threshold,
+                    "asr_status": asr_status,
+                    "low_confidence_reason": low_conf_reason,
+                    "raw_text": raw_text,
+                }
+                _log_trace(
+                    "ASR_LOW_CONFIDENCE",
+                    f"ASR Low Confidence: {asr_confidence:.2f} < {threshold} ({low_conf_reason})",
+                    "insufficient",
+                    diag_payload,
+                )
+                yield {
+                    "event": "voice_to_text_low_confidence",
+                    "message": "Couldn't confidently transcribe that. Please try again.",
+                    "low_confidence_reason": low_conf_reason,
+                    "diagnostics": diag_payload,
+                    "raw_text": raw_text,
+                    "normalized_text": transcribed_text,
+                    "confidence": asr_confidence,
+                    "voice_mode": voice_mode,
+                    "voice_session_id": voice_session_id,
+                    "trace_id": trace_id,
+                    "turn_id": turn_id,
+                }
+                return
+
+            _log_trace(
+                "VOICE_TO_TEXT_COMPLETED",
+                f'Voice-to-Text completed: "{transcribed_text}"',
+                "verified",
+                {"raw_text": raw_text, "normalized_text": transcribed_text, "confidence": asr_confidence},
+            )
+            yield {
+                "event": "voice_to_text_completed",
+                "raw_text": raw_text,
+                "normalized_text": transcribed_text,
+                "confidence": asr_confidence,
+                "language": lang_info,
+                "voice_mode": voice_mode,
+                "voice_session_id": voice_session_id,
+                "trace_id": trace_id,
+                "turn_id": turn_id,
             }
             return
 
         # Check clarification context if user is answering a previous question
-        if isinstance(clarification_context, str) and clarification_context.strip():
-            try:
-                clarification_context = json.loads(clarification_context)
-            except Exception:
-                clarification_context = None
+        clarif_dict: dict[str, Any] | None = None
+        if isinstance(clarification_context, str):
+            if clarification_context.strip():
+                try:
+                    loaded = json.loads(clarification_context)
+                    if isinstance(loaded, dict):
+                        clarif_dict = loaded
+                except Exception:
+                    clarif_dict = None
+        elif isinstance(clarification_context, dict):
+            clarif_dict = clarification_context
 
-        if clarification_context:
+        if clarif_dict:
             from backend.services.voice.clarification import resolve_clarification_response
             resolved_text = resolve_clarification_response(
                 transcribed_text,
-                clarification_context,
+                clarif_dict,
                 language=lang_info.get("code", "en"),
             )
             _log_trace(
                 "clarification_resolved",
                 f'Clarification answer merged: "{resolved_text}"',
                 "verified",
-                {"original": clarification_context.get("original_query"), "answer": transcribed_text, "resolved": resolved_text},
+                {"original": clarif_dict.get("original_query"), "answer": transcribed_text, "resolved": resolved_text},
             )
             yield {
                 "event": "clarification_resolved",
-                "original_query": clarification_context.get("original_query"),
+                "original_query": clarif_dict.get("original_query"),
                 "answer": transcribed_text,
                 "resolved_query": resolved_text,
             }
@@ -1394,6 +1874,7 @@ class VoiceService:
             "total_latency_ms": round(total_latency_ms, 1),
         }
 
+        _log_trace("VOICE_CAPTURE_RESUMED", "Continuous conversational voice capture resumed", "allowed")
         _log_trace("LISTENING_RESUMED", "Continuous conversational turn ready", "allowed")
         _log_trace(
             "VOICE_SESSION_ENDED",
@@ -1444,7 +1925,19 @@ class VoiceService:
             "model_id": model_id,
             "requires_human_review": False,
             "approval_id": None,
+            "voice_mode": voice_mode,
+            "voice_session_id": voice_session_id,
+            "turn_id": turn_id,
         }
+
+        if voice_mode == "NOVA" and not self.is_interrupted(session_id) and not self.is_voice_session_stopped(voice_session_id):
+            yield {
+                "event": "listening",
+                "voice_mode": "NOVA",
+                "voice_session_id": voice_session_id,
+                "turn_id": turn_id,
+                "trace_id": trace_id,
+            }
 
 
 # Singleton instance pattern

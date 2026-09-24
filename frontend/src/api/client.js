@@ -212,10 +212,18 @@ export const audit = {
     const searchParams = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
       if (value !== null && value !== undefined) {
-        searchParams.append(key, value);
+        if (typeof value === 'string') {
+          const trimmed = value.trim();
+          if (trimmed !== '') {
+            searchParams.append(key, trimmed);
+          }
+        } else {
+          searchParams.append(key, value);
+        }
       }
     });
-    return request(`/api/audit/logs?${searchParams.toString()}`);
+    const qs = searchParams.toString();
+    return request(`/api/audit/logs${qs ? `?${qs}` : ''}`);
   },
 };
 
@@ -330,12 +338,29 @@ export const voice = {
     return request(`/api/voice/greeting?language=${encodeURIComponent(language || 'en')}`);
   },
 
-  interrupt: (sessionId = null) => {
+  interrupt: (sessionId = null, voiceSessionId = null) => {
     const formData = new FormData();
     if (sessionId) {
       formData.append('session_id', sessionId);
     }
+    if (voiceSessionId) {
+      formData.append('voice_session_id', voiceSessionId);
+    }
     return request('/api/voice/interrupt', {
+      method: 'POST',
+      body: formData,
+    });
+  },
+
+  stop: (voiceSessionId = null, sessionId = null) => {
+    const formData = new FormData();
+    if (voiceSessionId) {
+      formData.append('voice_session_id', voiceSessionId);
+    }
+    if (sessionId) {
+      formData.append('session_id', sessionId);
+    }
+    return request('/api/voice/stop', {
       method: 'POST',
       body: formData,
     });
@@ -349,7 +374,9 @@ export const voice = {
     clarificationContext = null,
     onEvent = null,
     signal = null,
-    turnId = null
+    turnId = null,
+    voiceMode = 'NOVA',
+    voiceSessionId = null
   ) => {
     const formData = new FormData();
     if (audioBlob) {
@@ -366,6 +393,12 @@ export const voice = {
     }
     if (turnId !== null && turnId !== undefined) {
       formData.append('turn_id', turnId);
+    }
+    if (voiceMode) {
+      formData.append('voice_mode', voiceMode);
+    }
+    if (voiceSessionId) {
+      formData.append('voice_session_id', voiceSessionId);
     }
     if (clarificationContext) {
       formData.append(

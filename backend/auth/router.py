@@ -10,8 +10,8 @@ from pydantic import BaseModel, field_validator
 from backend.auth.dependencies import get_current_session, get_current_user
 from backend.auth.password import verify_password
 from backend.auth.session import create_session, invalidate_token
-from backend.database.repositories import audit as audit_repo
 from backend.database.repositories import users as users_repo
+from backend.services.audit import audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     user = users_repo.get_user_by_username(body.username)
 
     if user is None or not verify_password(user["password_hash"], body.password):
-        audit_repo.write_log(
+        audit_log(
             action="login",
             outcome="failure",
             username=body.username,
@@ -68,7 +68,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         )
 
     if not user["is_active"]:
-        audit_repo.write_log(
+        audit_log(
             action="login",
             outcome="denied",
             user_id=user["id"],
@@ -95,7 +95,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     roles = users_repo.get_user_roles(user["id"])
 
-    audit_repo.write_log(
+    audit_log(
         action="login",
         outcome="success",
         user_id=user["id"],
@@ -117,8 +117,8 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
+    response: Response,
     session: dict = Depends(get_current_session),
-    response: Response = None,
 ):
     """Invalidate the current session."""
     invalidate_token(session["token"])
@@ -126,7 +126,7 @@ async def logout(
     if response:
         response.delete_cookie("session_token")
 
-    audit_repo.write_log(
+    audit_log(
         action="logout",
         outcome="success",
         user_id=session["user_id"],

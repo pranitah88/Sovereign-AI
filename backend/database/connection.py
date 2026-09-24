@@ -41,7 +41,7 @@ def configure(db_path: Path | str | None = None) -> Path:
 
     _db_path.parent.mkdir(parents=True, exist_ok=True)
     _initialized = True
-    logger.info("Database configured at: %s", _db_path)
+    logger.info("ACTIVE AUTHORITATIVE DATABASE PATH: %s", _db_path)
     return _db_path
 
 

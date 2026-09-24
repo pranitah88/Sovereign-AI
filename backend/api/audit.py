@@ -27,6 +27,12 @@ async def get_audit_logs(
     offset: int = Query(0, ge=0),
 ):
     """Paginated audit log query with filters. Admin/Auditor only."""
+    # Normalize query parameters: strip whitespace and treat empty strings as None
+    action = action.strip() if action and action.strip() else None
+    outcome = outcome.strip() if outcome and outcome.strip() else None
+    start_date = start_date.strip() if start_date and start_date.strip() else None
+    end_date = end_date.strip() if end_date and end_date.strip() else None
+
     logs = audit_repo.query_logs(
         user_id=user_id,
         action=action,

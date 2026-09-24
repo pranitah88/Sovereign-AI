@@ -299,6 +299,18 @@ def determine_conversational_context(
             reason=f"Explicit entity in current query: {current_tags[0]}",
         )
 
+    # 1b. Check if query is incomplete or ambiguous — must NEVER inherit prior turn context
+    from backend.services.voice.clarification import check_query_completeness, check_ambiguous_entity
+    is_incomplete, _ = check_query_completeness(text)
+    is_ambig, _, _ = check_ambiguous_entity(text)
+    if is_incomplete or (is_ambig and "mrp" in text_lower):
+        return ContextResolution(
+            is_followup=False,
+            resolved_retrieval_query=text,
+            target_entity=None,
+            reason="Incomplete or ambiguous query; cannot inherit prior context",
+        )
+
     # 2. Check for clear company / general corporate queries that are always independent
     standalone_topics = [
         "mrpl", "ongc", "mangalore refinery", "refinery overview", "annual report",

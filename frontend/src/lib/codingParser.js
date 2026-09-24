@@ -11,7 +11,8 @@
 export function stripRawUiMarkers(text) {
   if (!text || typeof text !== 'string') return '';
   return text
-    .replace(/svg(?:Copy|Query|Retrieval|Model|Tools|Response|Download)/gi, '')
+    // Strip raw "svg" prefix prepended to UI button / trace labels
+    .replace(/\bsvg(?=Copy|Query|Retrieval|Model|Tools|Response|Download)/gi, '')
     .trim();
 }
 
